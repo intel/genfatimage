@@ -30,6 +30,22 @@ EOF
 
 # The FAT and GPT Unicode encoding
 my $FATUNI = Encode::find_encoding('UTF-16LE');
+my $FATOEM = Encode::find_encoding('IBM-850');
+my $NATIVE = Encode::find_encoding('utf8'); # Hope so?
+
+sub to_uni($) {
+    my($s) = @_;
+    Encode::from_to($s, $NATIVE, $FATUNI);
+    return $s;
+}
+sub to_oem($) {
+    my($s) = @_;
+    Encode::from_to($s, $NATIVE, $FATOEM);
+    return $s;
+}
+
+# Null filehandle, useful to have
+open(my $nullfh, '+>', File::Spec->devnull);
 
 sub min(@) {
     my $x;
@@ -93,7 +109,6 @@ my $efi_system_type
     = guid(0xc12a7328, 0xf81f, 0x11d2, 0xba4b, 0x00a0c93ec93b);
 
 sub gen_gpt($$$;$$$) {
-    use bytes;
     my($disk_len, $part_start, $part_len, $part_type, $gpt_len, $hs) = @_;
     my @blks = (undef) x 4;
 
@@ -119,8 +134,8 @@ sub gen_gpt($$$;$$$) {
 
     # GPT partition array
     $blks[3] = $part_type . rand_guid() .
-	pack('Q<Q<Q<', $part_start, $part_start + $part_len - 1, 1) .
-	substr(encode($FATUNI, $volname), 0, 71*2) . "\0\0";
+	pack('Q<Q<Q<a142v', $part_start, $part_start + $part_len - 1, 1,
+	     to_uni($volname), 0);
     $blks[3] .= ("\0" x (512*$gpt_len - length($blks[3])));
     my $array_crc = crc32($blks[3]);
 
@@ -201,9 +216,10 @@ sub pathlist($;$) {
 my $err = 0;
 
 # Directory entry types, and lists of nodes of each type
-my $FILE = 1;
-my $DIR  = 2;
-my @nodes = (undef, [], []);
+my $VOL  = 0x08;
+my $DIR  = 0x10;
+my $FILE = 0x20;		# == ARCHIVE bit
+my %nodes = ($DIR => [], $FILE => []);
 
 # Creates or finds a node in the directory tree from a list of names
 # and returns a reference to it
@@ -218,8 +234,9 @@ sub mktreenode($@) {
 	if (!$here->{type}) {
 	    $here->{type}  = $DIR;
 	    $here->{files} = {};
-	    push(@{$nodes[$DIR]}, $here);
-	} elsif ($here->{type} ne $DIR) {
+	    $here->{shorthash} = {};
+	    push(@{$nodes{$DIR}}, $here);
+	} elsif ($here->{type} != $DIR) {
 	    print STDERR "$outfile: file and directory conflict: $herepath\n";
 	    $err++;
 	    return undef;
@@ -232,7 +249,7 @@ sub mktreenode($@) {
 	$here = $there->{files}->{$f};
 	if (!defined($here)) {
 	    # New directory entry, unknown type so far
-	    $here = {'name' => $f, 'path' => $herepath.'/'.$f};
+	    $here = {'up' => $there, 'name' => $f, 'path' => $herepath.'/'.$f};
 	    $there->{files}->{$f} = $here;
 	}
     }
@@ -273,8 +290,8 @@ sub inputnode($$) {
 
 # Create the root directory node
 sub rootdir() {
-    my $root = { 'path' => '', 'type' => $DIR, 'files' => {} };
-    push(@{$nodes[$DIR]}, $root);
+    my $root = { 'path' => undef, 'type' => $DIR, 'files' => {} };
+    push(@{$nodes{$DIR}}, $root);
     return $root;
 }
 
@@ -306,14 +323,16 @@ sub add_input($;$) {
 	print STDERR "$outfile: input not found: $inpath\n";
 	return;
     }
-
     my $mode = $st[2];
+
+    $dest->{date}  = $st[9];
+    $dest->{flags} = !($mode & S_IWRITE); # Readonly bit
 
     if (S_ISDIR($mode)) {
 	if (!$dest->{type}) {
 	    $dest->{type} = $DIR;
 	    $dest->{files} = {};
-	    push(@{$nodes[$DIR]}, $dest);
+	    push(@{$nodes{$DIR}}, $dest);
 	} elsif ($dest->{type} != $DIR) {
 	    printf STDERR "%s: file and directory conflict: %s\n",
 		$outfile, $dest->{path};
@@ -343,7 +362,7 @@ sub add_input($;$) {
 	}
 	$dest->{type} = $FILE;
 	$dest->{size} = $st[7];
-	push(@{$nodes[$FILE]}, $dest);
+	push(@{$nodes{$FILE}}, $dest);
     } else {
 	printf STDERR "$outfile: skipping non-regular file: $inpath\n";
 	$err++;
@@ -351,12 +370,29 @@ sub add_input($;$) {
     }
 }
 
+#
+# Read all the input files
+#
+sub read_inputs(@) {
+    my(@inputs) = @_;
+
+    my $root = rootdir();
+
+    foreach my $input (@inputs) {
+	add_input(inputnode($root, $input));
+    }
+
+    return $root;
+}
+
 sub gendirsizes() {
-    foreach my $d (@{$nodes[$DIR]}) {
-	my $e = 2; # . and .., or label
+    foreach my $d (@{$nodes{$DIR}}) {
+	my $e = defined($d->{up}) ? 2 : 0;
+
 	# One entry for each 13 UTF-16 codepoints, plus one
-	foreach my $f (keys(%{$d->{files}})) {
-	    my $u = encode($FATUNI, $f, Encode::LEAVE_SRC);
+	foreach my $f ($d->{volname}, keys(%{$d->{files}})) {
+	    next unless (defined($f));
+	    my $u = to_uni($f);
 	    $e += (length($u)+25+26)/26;
 	}
 
@@ -366,8 +402,6 @@ sub gendirsizes() {
     }
 }
 
-# These functions are allowed to overcount, but not undercount
-
 sub count_clusters($) {
     my($cshift) = @_;
     my $clust = 0;
@@ -375,13 +409,15 @@ sub count_clusters($) {
     $cshift += 9;		# sectors to bytes
     my $csize = 1 << $cshift;
 
-    foreach my $f (@{$nodes[$FILE]}, @{$nodes[$DIR]}) {
+    foreach my $f (@{$nodes{$DIR}}, @{$nodes{$FILE}}) {
 	$clust += ($f->{size} + $csize - 1) >> $cshift;
     }
 
     return $clust;
 }
 
+# Create preliminary format parameters for a specific cluster size.
+# This function *is* allowed to overestimate.
 sub get_format_params($$) {
     my($root, $cshift) = @_;
     my $csize = 1 << $cshift;
@@ -419,33 +455,138 @@ sub get_format_params($$) {
     $sectors += $nfats*$fatsize;
 
     # Reserved sectors
-    my $resv = max(($fattype < 8) ? 1 : 32, $csize);
+    my $resv = max(($fattype < 32) ? 1 : 32, $csize);
     $sectors += $resv;
 
-    # Root directory size. The size of the root directory is already
-    # accounted for in the cluster count, even though FAT12/16 does
-    # not give them cluster numbers (so can overcount the FAT size slightly,
-    # that is OK.
-    my $rootdirent = align_up($root->{size}, $csize) >> 5;
-
     # Generated filesystem image parameters. May be an overestimate.
-    return [$sectors, $cshift, $fattype, $resv, $nfats, $fatsize,
-	    $rootdirent, $c];
+    return {
+	'sectors' => $sectors, 'cshift' => $cshift,
+	'csectors' => 1 << $cshift, 'cbytes' => 512 << $cshift,
+	'cbshift' => $cshift + 9, 'fattype' => $fattype,
+	'resv' => $resv, 'nfats' => $nfats, 'fatsize' => $fatsize,
+	'clust' => $c, 'secshift' => 9, 'sector' => 512,
+	'media' => 0xf8, 'h' => 255, 's' => 63
+    };
 }
 
-sub read_inputs(@) {
-    my(@inputs) = @_;
+# Update the format parameters after the disk layout is complete
+sub finalize_format_params($$$$) {
+    my($root, $parm, $startsec, $fssec) = @_;
+    $parm->{hidden}  = $startsec;
 
-    my $root = rootdir();
+    my $prefixsec = $parm->{resv} + $parm->{fatsize} * $parm->{nfats};
 
-    foreach my $input (@inputs) {
-	add_input(inputnode($root, $input));
+    if (!$root->{clustno}) {
+	$prefixsec += $root->{paddedsize} >> $parm->{secshift};
     }
 
-    return $root;
+    # Compute the final size of the filesystem
+    my $fattypemax = (1 << $parm->{fattype}) - 12;
+    my $fatsizemax = ($parm->{fatsize} << ($parm->{secshift} + 3))
+	/ $parm->{fattype};
+    my $spacemax = ($fssec - $prefixsec) >> $parm->{cshift};
+
+    $parm->{clust}   = min($spacemax, $fattypemax, $fatsizemax);
+    $parm->{sectors} = $prefixsec + ($parm->{clust} << $parm->{cshift});
 }
 
-my $nullfh;
+# Assign final cluster numbers and padded sizes to files and directories
+sub assign_clusters($) {
+    my($parm) = @_;
+    my $csize  = $parm->{cbytes};
+    my $cshift = $parm->{cbshift};
+
+    # The root directory is always first in @{$nodes{$DIR}}
+    my $fat1216_root = $parm->{fattype} < 32;
+
+    my $clustno = 2;		# First "real" cluster number
+
+    foreach my $f (@{$nodes{$DIR}}, @{$nodes{$FILE}}) {
+	$f->{paddedsize} = align_up($f->{size}, $csize);
+	$f->{nclust} = $f->{paddedsize} >> $cshift;
+	if (!$f->{nclust} || $fat1216_root) {
+	    # Zero-length file or the FAT12/16 root directory
+	    # For the latter, {nclust} is still assigned
+	    $f->{clustno} = 0;
+	    $fat1216_root = 0;
+	} else {
+	    $f->{clustno} = $clustno;
+	    $clustno += $f->{nclust};
+	}
+    }
+
+    die if ($clustno > $parm->{clust} + 2);
+    return $parm->{endclust} = $clustno;
+}
+
+# Emit one FAT entry. $hold should be a reference to a scalar
+# used for the even-numbered (first) part of a FAT12 pair.
+# The number should be masked so that the special numbers at the end
+# of the number range can be represeented by -9 to -1.
+sub emit_fat12($$$) {
+    my($out, $num, $hold) = @_;
+
+    $num &= 0xfff;
+
+    if (!defined($$hold)) {
+	$$hold = $num;
+	return 0;
+    }
+
+    $num <<= 12;
+    $num |= $$hold;
+    undef($$hold);
+    print $out pack('vC', $num & 0xffff, $num >> 16);
+    return 3;
+}
+sub emit_fat16($$$) {
+    my($out, $num, $hold) = @_;
+    print $out pack('v', $num & 0xffff);
+    return 2;
+}
+sub emit_fat32($$$) {
+    my($out, $num, $hold) = @_;
+    print $out pack('V', $num & 0x0fffffff);
+    return 4;
+}
+
+sub emit_one_fat($) {
+    my($parm) = @_;
+    my $out = $parm->{out};
+    my %emit_func = (
+	12 => \&emit_fat12,
+	16 => \&emit_fat16,
+	32 => \&emit_fat32
+    );
+    my $emit = $emit_func{$parm->{fattype}};
+    my $hold;
+    my $bytes = 0;
+
+    # The two special entries at the start
+    $bytes += $emit->($out, $parm->{media} - 256, \$hold);
+    $bytes += $emit->($out, -1, \$hold);
+
+    my $clustno = 2;
+    foreach my $f (@{$nodes{$DIR}}, @{$nodes{$FILE}}) {
+	next if (!$f->{clustno});		# No cluster chain
+	die if ($f->{clustno} != $clustno);	# This would be bad...
+	my $nclust = $f->{nclust};
+	while (--$nclust) {
+	    # Emit the *next* cluster number
+	    $bytes += $emit->($out, ++$clustno, \$hold);
+	}
+	$bytes += $emit->($out, -1, \$hold); # End of cluster chain
+	$clustno++;
+    }
+
+    # Flush any partial output
+    while (defined($hold)) {
+	$bytes += $emit->($out, 0, \$hold);
+    }
+
+    $bytes += emitzero($out, ($parm->{fatsize} << 9) - $bytes);
+    return $bytes;
+}
 
 sub vsystem(@) {
     my @cmd = grep { defined($_) } @_;
@@ -476,130 +617,388 @@ sub vsystem(@) {
     return $sys;
 }
 
-sub pp_file {
-    my($f) = @_;
-    vsystem('mcopy', '-m', '-D', 'o', '-D', 'A',
-	    $f->{inpath}, 'z:'.$f->{path});
-}
-sub pp_dir {
-    my($f) = @_;
-    vsystem('mmd', 'z:'.$f->{path});
+# Maximum chunk size for writezero() and emit_file()
+my $BUFSIZ = 1024*1024;
+
+sub emit($@) {
+    my $fh = shift(@_);
+    my $bytes = 0;
+
+    foreach my $s (@_) {
+	$bytes += length($s);
+	print $fh $s;
+    }
+
+    return $bytes;
 }
 
-# Note: this does NOT process the root directory!
-sub populate_with($$$) {
-    my($dir, $type, $what) = @_;
+sub emitzero($$) {
+    my($fh, $bytes) = @_;
+    my $left = $bytes;
+
+    while ($left) {
+	my $chunk = min($left, $BUFSIZ);
+	print $fh ("\0" x $chunk);
+	$left -= $chunk;
+    }
+
+    return $bytes;
+}
+
+# Generate a short filename. For simplicity, only consider ASCII
+# characters as valid shortname characters. $shorthash is a reference
+# to an hash for the directory within which the conversion is happening.
+sub genshortname($$) {
+    my($fullname, $shorthash) = @_;
+
+    my $name = uc($fullname);
+    my $head;
+    my $ext;
+
+    if ($name =~ /^([~A-Z0-9\$\%\'_\@\`!(){}^\#\&-]{1,8})(?:\.([~A-Z0-9\$\%\'_~\@\`!()e{}^\#\&-]{1,3}))?$/) {
+	# Exact conversion possible
+	my $xname = pack('A8A3', $1, $2);
+	if (!defined($shorthash->{$xname})) {
+	    $shorthash->{$xname} = $fullname;
+	    return $xname;
+	}
+    }
+
+    $name =~ s/[^\.~A-Z0-9\$\%\'_\@\`!(){}^\#\&-]/_/g;
+    $name =~ s/^\./_/;
+    $name =~ s/\.$/_/;
+
+    die unless ($name =~ /^(.+?)(?:\.([^.]+))$/);
+    my $head = substr($1, 0, 8);
+    my $ext  = substr($2, 0, 3);
+
+    for (my $ctr = 1; $ctr <= 99999; $ctr++) {
+	$head = substr($head, 0, 7-length($ctr)) . '~' . $ctr;
+	$name = pack('A8A3', $head, $ext);
+	if (!defined($shorthash->{$name})) {
+	    $shorthash->{$name} = $fullname;
+	    return $name;
+	}
+    }
+
+    die "$outfile: directory too long\n";
+}
+
+sub dosdate($) {
+    my($time) = @_;
+
+    my @lt = localtime($time);
+
+    $lt[5] -= 80;		# Convert year to 1980-based
+    $lt[4] += 1;		# Convert month to 1-based
+
+    if ($lt[5] < 0) {
+	@lt = (0, 0, 0, 1, 1, 0);
+    } elsif ($lt[5] > 127) {
+	@lt = (59, 59, 23, 31, 12, 127);
+    }
+
+    return ($lt[5] << 25) + ($lt[4] << 21) + ($lt[3] << 16) +
+	($lt[2] << 11) + ($lt[1] << 5) + ($lt[0] >> 1);
+}
+
+sub node_date($) {
+    my($node) = @_;
+
+    do {
+	if (defined($node->{date})) {
+	    return $node->{date};
+	}
+	$node = $node->{up};
+    } while (defined($node));
+
+    return 0;
+}
+
+sub dir_shortent($$$$$) {
+    my($name, $attr, $date, $clustno, $size) = @_;
+
+    $size = 0 if ($attr & ($DIR|$VOL));
+
+    my $datetime = dosdate($date);
+    return pack('A11Ca8vVvV', $name, $attr, '',
+		$clustno >> 16, $datetime, $clustno & 0xffff, $size);
+}
+
+sub dir_longent($$;$) {
+    my($name, $shortent, $maxlong) = @_;
+
+    $maxlong = 255 unless (defined($maxlong));
+
+    my @longname = unpack("v$maxlong", to_uni($name));
+    push(@longname, 0) if (scalar(@longname) % 13);
+    while (scalar(@longname) % 13) {
+	push(@longname, 0xffff);
+    }
+
+    my $namesum = 0;
+    foreach my $nb (unpack('C11', $shortent)) {
+	$namesum = (($namesum & 1) << 7) + ($namesum >> 1) + $nb;
+	$namesum &= 0xff;
+    }
+
+    my $longcnt = scalar(@longname)/13;
+    my $longctr = $longcnt | 0x40;
+    my $longent = '';
+    while ($longctr) {
+	$longent .= pack('Cv5CCCv*', $longctr, @longname[-13...-9],
+			 0x0f, 0, $namesum, @longname[-8...-3],
+			 0, @longname[-2...-1]);
+	$longctr = ($longctr & 0x3f) - 1;
+	delete @longname[-13...-1];
+    }
+
+    return $longent . $shortent;
+}
+
+sub emit_direntry($$$) {
+    my($f, $parm, $shorthash) = @_;
+
+    my $attr = ($f->{type} & ($DIR|$VOL)) | $f->{flags};
+    my $ent = dir_shortent(genshortname($f->{name}, $shorthash),
+			   $attr, node_date($f), $f->{clustno}, $f->{size});
+    $ent = dir_longent($f->{name}, $ent);
+
+    return emit($parm->{out}, $ent);
+}
+
+# Emit the contents of a directory
+sub emit_dir {
+    my($dir, $parm) = @_;
+    my $de;
+    my %shorthash;
+
+    # Special entries at the beginning
+
+    my $dirdate = $dir->{date} = node_date($dir);
+    my $up = $dir->{up};
+
+    if (defined($up)) {
+	# Not the root directory, emit . and ..
+	$de  = dir_shortent('.',  $DIR, $dirdate, $dir->{clustno}, 0);
+
+	# For some stupid reasons .. is supposed to have 0 in the cluster
+	# pointer when it points to the root directory even on FAT32...
+	my $upptr = defined($up->{up}) ? $up->{clustno} : 0;
+	$de .= dir_shortent('..', $DIR, $dirdate, $upptr,  0);
+    } elsif (defined($dir->{volname})) {
+	# Root directory, emit label. Note that the label is not
+	# limited to 8.3 format, it is just 11 characters, and has to
+	# match the field in the boot sector.
+	$de = dir_shortent($dir->{shortvol}, $VOL, $dirdate, 0, 0);
+	$de = dir_longent($dir->{volname}, $de);
+    }
+
+    my $bytes = emit($parm->{out}, $de);
+
+    # Regular directory entries
+    my @files = sort {
+	$a->{type} <=> $b->{type} || $a->{name} cmp $b->{name}
+    } values(%{$dir->{files}});
+
+    foreach my $f (@files) {
+	$bytes += emit_direntry($f, $parm, \%shorthash);
+    }
+
+    $bytes += emitzero($parm->{out}, $dir->{paddedsize} - $bytes);
+    return $bytes;
+}
+
+# Copy the contents of a file
+sub emit_file {
+    my($f, $parm) = @_;
+    my $sizeleft = $f->{size};
+    my $cpad = $f->{paddedsize} - $sizeleft;
+    my $bytes = 0;
+
+    return if (!$sizeleft);	# Empty file
+
+    my $out = $parm->{out};
+
+    my $in;
+    if (open($in, '<:raw', $f->{inpath})) {
+	binmode $in;
+	while ($sizeleft) {
+	    my $buf;
+	    my $chunk = read($in, $buf, min($BUFSIZ, $sizeleft));
+	    last if (!$chunk);
+	    $bytes += emit($out, $buf);
+	    $sizeleft -= $chunk;
+	}
+	close($in);
+    }
+
+    if ($sizeleft) {
+	print STDERR "%s: %s: %s\n", $outfile, $f->{inpath}, $!;
+	$err++;
+    }
+
+    $bytes += emitzero($out, $f->{paddedsize} - $bytes);
+    return $bytes;
+}
+
+# Note: this does NOT process the $dir node itself
+sub populate_with($$$$) {
+    my($dir, $parm, $type, $what) = @_;
     my @dents = sort { $a->{name} cmp $b->{name} } values(%{$dir->{files}});
+    my $ret = 0;
 
     foreach my $de (@dents) {
-	$what->($de) if ($de->{type} == $type);
-	populate_with($de, $type, $what) if ($de->{type} == $DIR);
+	if ($de->{type} == $type) {
+	    $ret += $what->($de, $parm);
+	}
+	if ($de->{type} == $DIR) {
+	    $ret += populate_with($de, $parm, $type, $what);
+	}
     }
+
+    return $ret;
+}
+
+# Generate the FAT superblock
+my $whoami = 'mkefiimg';
+sub emit_superblock($$) {
+    my($root, $parm) = @_;
+    my $fat = $parm->{fattype};
+
+    my $sec32 = $parm->{sectors};
+    my $sec16 = ($fat < 32 && $sec32 <= 0xffff) ? $sec32 : 0;
+
+    my $bs = pack('CvA8vCvCvvCvvvVV',
+		  0xe9, 0x1f8-3, $whoami, $parm->{sector},
+		  $parm->{csectors}, $parm->{resv}, $parm->{nfats},
+		  $root->{clustno} ? 0 : $root->{paddedsize} >> 5,
+		  $sec16, $parm->{media},
+		  $fat < 32 ? $parm->{fatsize} : 0,
+		  $parm->{s}, $parm->{h}, $parm->{hidden}, $sec32);
+
+    my $backupsb = 6;
+
+    if ($fat >= 32) {
+	# Weirdly injected in the middle of the FAT12/16 boot sector
+	$bs .= pack('VvvVvva12', $parm->{fatsize}, 0, 0x0000,
+		    $root->{clustno}, 1, $backupsb, '');
+    }
+
+    $bs .= pack('CCCVA11A8', 0x80, 0, 0x29, $root->{volid},
+		$root->{shortvol}, "FAT$fat");
+
+    $bs .= ("\0" x (0x1f8 - length($bs)));
+    $bs .= "\xcd\x18\xf4\xeb\xfb\0\x55\xaa";
+
+    my $out = $parm->{out};
+    my $bytes = emit($out, $bs);
+
+    if ($fat >= 32) {
+	my $fsinfo = pack('A4a480A4VVa12V',
+			  'RRaA', '', 'rrAa',
+			  $parm->{clust} - $parm->{endclust} + 2,
+			  $parm->{endclust},
+			  '', 0xaa550000);
+	$bytes += emit($out, $fsinfo);
+	$bytes += emitzero($out, ($backupsb - 2) << 9);
+	$bytes += emit($out, $bs, $fsinfo);
+    }
+    $bytes += emitzero($out, ($parm->{resv} << $parm->{secshift}) - $bytes);
+    return $bytes;
+}
+
+# Create long and short volume labels
+sub create_vol_label($$) {
+    my($root, $vol) = @_;
+
+    $root->{volname}  = $vol;
+    $root->{shortvol} = pack('A11', to_oem($vol));
+    $root->{volid}    = unpack('V', rand_bytes(4));
 }
 
 sub make_filesystem($) {
     my($root) = @_;
 
+    create_vol_label($root, $volname);
     gendirsizes();
 
     # Compute a suitable cluster shift.
-    my $bestparm = undef;
-    my @csparm;
+    my $parm = undef;
     for (my $cs = 0; $cs < 7; $cs++) {
-	my $parm = get_format_params($root, $cs);
-	push(@csparm, $parm);
-	next unless (defined($parm));
+	my $thisparm = get_format_params($root, $cs);
+	next unless (defined($thisparm));
 	if ($verbose >= 2) {
 	    printf STDERR "clust %3d: FAT%d, sectors %8d, clust %8d\n",
-		1 << $cs, $parm->[2], $parm->[0], $parm->[7];
+		1 << $cs, $thisparm->{fattype}, $thisparm->{sectors},
+		$thisparm->{clust};
 	}
-	if (!defined($bestparm) || ($parm->[0] < $bestparm->[0])) {
-	    $bestparm = $parm;
+	if (!defined($parm) || ($thisparm->{sectors} < $parm->{sectors})) {
+	    $parm = $thisparm;
 	}
 	# Avoid 128-sector clusters unless we really need them
-	last if (defined($bestparm) && $cs >= 6);
+	last if (defined($parm) && $cs >= 6);
     }
 
-    die "$outfile: filesystem too large\n" unless (defined($bestparm));
+    die "$outfile: filesystem too large\n" unless (defined($parm));
 
     # Cluster bytes
-    my $csectors = 1 << $bestparm->[1];
+    my $csectors = $parm->{csectors};
 
     # Block alignment in sectors
-    my $align    = max($csectors, 2);
-    my $gptsize  = 1;		# In sectors, standard = 32
-    my $startsec = align_up($gptsize+2, $align); # +2 for PMBR, header
+    my $align     = $csectors;
+    my $gptsize   = 1;		# In sectors, standard = 32
+    my $startsec  = align_up($gptsize+2, $align); # +2 for PMBR, header
 
     # Initial gpt + alignent + and 33 sectors for backup gpt.
-    # mkdosfs takes size input in 1K blocks, but also rounds the size
-    # down to a multiple of the "track size", so let that also be 2...
-    my $minfssec = align_up($bestparm->[0],2);
-    my $sectors = $minfssec + $startsec + ($gptsize+1);
-    $sectors  = align_up($sectors, $align);
-    my $fssec = $sectors - $startsec - ($gptsize+1);
+    my $sectors   = $parm->{sectors} + $startsec + ($gptsize+1);
+    $sectors      = align_up($sectors, $align);
+    my $backupgpt = $sectors - ($gptsize+1);
+    my $fssec     = $backupgpt - $startsec;
 
-    # Construct a fake geometry just for the heck of it, and because
-    # mkdosfs rounds the filesystem size down to a multiple of the
-    # "track" size.
-    # ~1 to cope with mkdosfs taking units of 1K
-    my @hs = (255, 63);
-    for ($hs[1] = 63; $hs[1] > 1; $hs[1]--) {
-	last if (align_down($fssec & ~1, $hs[1]) >= $minfssec);
-    }
+    # Update with the actually generated layout
+    finalize_format_params($root, $parm, $startsec, $fssec);
+    assign_clusters($parm);
 
-    # Create the empty image. O_RDWR|O_APPEND is required on Windows,
-    # hence this really weird combinations of flags.
-    sysopen(my $out, $outfile, O_RDWR|O_TRUNC|O_CREAT|O_APPEND, 0666)
-	or die "$outfile: $!\n";
-    $out->autoflush(1);
+    # Output the image
+    open(my $out, '>', $outfile) or die "$outfile: $!\n";
+    binmode $out;
+    $parm->{out} = $out;
 
     # Create the GPT partition table
     my @gpt = gen_gpt($sectors, $startsec, $fssec, $efi_system_type,
-		      $gptsize, \@hs);
+		      $gptsize, [$parm->{h}, $parm->{s}]);
 
-    print $out $gpt[0], $gpt[1], $gpt[3];
+    my $bytes = emit($out, $gpt[0], $gpt[1], $gpt[3]);
+    $bytes += emitzero($out, ($startsec << 9) - $bytes);
 
-    # Pad the file for mkdosfs
-    truncate($out, ($startsec + $fssec) << 9);
+    # The boot sector/superblock
+    $bytes += emit_superblock($root, $parm);
 
-    # Create the filesystem
-    vsystem('mkdosfs', $verbose ? ('-v') : (),
-	    '-n', substr($volname, 0, 11),
-	    '-F', $bestparm->[2],
-	    '-S', 512, '-s', 1 << $bestparm->[1],
-	    '-g', $hs[0].'/'.$hs[1],
-	    '--offset', $startsec, '-f', $bestparm->[4],
-	    '-R', $bestparm->[3],
-	    $bestparm->[2] < 32 ? ('-r', $bestparm->[6]) : (),
-	    '-h', $startsec, $outfile, $fssec >> 1);
+    # The FATs
+    for (my $i = 0; $i < $parm->{nfats}; $i++) {
+	$bytes += emit_one_fat($parm);
+    }
 
-    # Create a mtools configuration file
-    my($mt, $mtoolsrc) = tempfile(TMPDIR => 1);
-    print  $mt "MTOOLS_FAT_COMPATIBILITY=1\n";
-    print  $mt "drive z:\n";
-    printf $mt " file=\"%s\"", $outfile;
-    printf $mt " offset=%d\n", $startsec << 9;
-    print  $mt " mformat_only\n";
-    close($mt);
+    # Root directory, subdirectories, files
+    $bytes += emit_dir($root, $parm);
+    $bytes += populate_with($root, $parm, $DIR,  \&emit_dir);
+    $bytes += populate_with($root, $parm, $FILE, \&emit_file);
 
-    $ENV{'MTOOLSRC'} = $mtoolsrc;
-
-    # Populate the output filesystem; directory hierarchy first
-    populate_with($root, $DIR,  \&pp_dir);
-    populate_with($root, $FILE, \&pp_file);
-
-    unlink($mtoolsrc);
 
     # Finally, output the backup GPT
-    print $out $gpt[3], $gpt[2];
+    $bytes += emitzero($out, ($backupgpt << 9) - $bytes);
+    $bytes += emit($out, $gpt[3], $gpt[2]);
+
+    die unless ($bytes == ($sectors << 9));
+
     close($out);
 }
 
 die "$0: needs a 64-bit integer Perl interpreter\n" unless (1 << 63);
 
-open($nullfh, '+>', File::Spec->devnull);
-
 my $root = read_inputs(@inputs);
 exit(1) if ($err);
 
 make_filesystem($root);
+exit(0);

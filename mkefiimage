@@ -1,0 +1,605 @@
+#!/usr/bin/perl
+
+use strict;
+use integer;
+use utf8;
+use feature qw(unicode_strings);
+
+use Encode qw(encode decode);
+use File::Spec;
+use Fcntl qw(:DEFAULT :mode);
+use File::Temp qw(tempfile);
+use IO::Handle;
+use IPC::Open3;
+use Crypt::Random::Source;
+use Digest::CRC qw(crc32);
+
+my $verbose = $ENV{'V'};
+my $volname = $ENV{'VOLNAME'} || 'EFI BOOT';
+
+my($outfile, @inputs) = @ARGV;
+
+if (!scalar(@inputs)) {
+    die <<EOF;
+Usage: $0 outfile input_path[::[destination]] ...
+       Inputs can be files or directories.
+       :: alone as a suffix indicates that the entire input_path
+       should be used as the destination name, not just its contents.
+EOF
+}
+
+# The FAT and GPT Unicode encoding
+my $FATUNI = Encode::find_encoding('UTF-16LE');
+
+sub min(@) {
+    my $x;
+    foreach my $y (@_) {
+	next unless (defined($y));
+	$x = $y if (!defined($x) || $y < $x);
+    }
+    return $x;
+}
+sub max(@) {
+    my $x;
+    foreach my $y (@_) {
+	next unless (defined($y));
+	$x = $y if (!defined($x) || $y > $x);
+    }
+    return $x;
+}
+
+sub align_down($$) {
+    my($val, $align) = @_;
+    return $val - ($val % $align);
+}
+sub align_up($$) {
+    my($val, $align) = @_;
+    return align_down($val + $align - 1, $align);
+}
+
+# Create a random (type 4) GUID
+# For Crypt::Random::Source < 0.13 using get_strong() would be better
+sub rand_bytes($) {
+    my($count) = @_;
+
+    if (Crypt::Random::Source->VERSION < 0.13) {
+	return Crypt::Random::Source::get_strong($count);
+    } else {
+	return Crypt::Random::Source::get_weak($count);
+    }
+}
+
+# Yeah, the byte ordering here is weird as heck
+sub guid($$$$$) {
+    my($a,$b,$c,$d,$e) = @_;
+    return pack('VvvQ>', $a, $b, $c, ($d << 48) | $e);
+}
+
+sub rand_guid() {
+    my @b = unpack('C*', rand_bytes(16));
+    $b[7] = ($b[7] & 0x0f) | 0x40; # Version 4 (random)
+    $b[8] = ($b[8] & 0x3f) | 0x80; # Variant 1
+    return pack('C*', @b);
+}
+
+#
+# Create a minimal GPT partition table with one single partition.
+# Return a vector containing the PMBR, the GPT header,
+# the backup GPT header, and the GPT array.
+#
+# $gpt_len if set indicates the size of the GPT array in sectors.
+#
+my $efi_system_type
+    = guid(0xc12a7328, 0xf81f, 0x11d2, 0xba4b, 0x00a0c93ec93b);
+
+sub gen_gpt($$$;$$$) {
+    use bytes;
+    my($disk_len, $part_start, $part_len, $part_type, $gpt_len, $hs) = @_;
+    my @blks = (undef) x 4;
+
+    $part_type = $efi_system_type unless (defined($part_type));
+    $gpt_len = 1 unless (defined($gpt_len));
+    $hs = [255, 63] unless (defined($hs));
+
+    # PMBR
+    my $end_lba = min($disk_len-1,0xffffffff);
+
+    my $end_s    = ($end_lba % $hs->[1]) + 1;
+    my $end_h    = ($end_lba/$hs->[1]) % $hs->[0];
+    my $end_c    = $end_lba/($hs->[0]*$hs->[1]);
+    if ($end_c > 1023) {
+	($end_c, $end_h, $end_s) = (1023, $hs->[0] - 1, $hs->[1]);
+    }
+
+    $blks[0] = ("\0" x 446) .
+	pack('CCCCCCCCVV', 0, 0, 2, 0, 0xee,
+	     $end_h, (($end_c >> 2) & 0xc0) | $end_s,
+	     $end_c & 0xff, 1, $end_lba) .
+	("\0" x 48)."\x55\xaa";
+
+    # GPT partition array
+    $blks[3] = $part_type . rand_guid() .
+	pack('Q<Q<Q<', $part_start, $part_start + $part_len - 1, 1) .
+	substr(encode($FATUNI, $volname), 0, 71*2) . "\0\0";
+    $blks[3] .= ("\0" x (512*$gpt_len - length($blks[3])));
+    my $array_crc = crc32($blks[3]);
+
+    # GPT headers (primary and alternate)
+    my $disk_guid = rand_guid();
+    for (my $i = 1; $i <= 2; $i++) {
+	my($here, $there, $array);
+	if ($i == 1) {
+	    $here  = 1;
+	    $there = $disk_len - 1;
+	    $array = $here + 1;
+	} else {
+	    $here  = $disk_len - 1;
+	    $there = 1;
+	    $array = $here - $gpt_len;
+	}
+
+	$blks[$i] = 'EFI PART'.
+	    pack('VVVVQ<Q<Q<Q<', 0x10000, 92, 0, 0,
+		 $here, $there, $gpt_len+2,  $disk_len-$gpt_len-2) .
+	    $disk_guid .
+	    pack('Q<VVV', $array, $gpt_len << 2, 128, $array_crc);
+
+	# Insert the header CRC
+	my $hdr_crc = crc32($blks[$i]);
+	substr($blks[$i], 16, 4) = pack('V', $hdr_crc);
+	$blks[$i] .= ("\0" x (512 - length($blks[$i])));
+    }
+
+    return @blks;
+}
+
+# Create a normalization of a pathname as a list suitable for
+# inserting in the directory tree.
+sub pathlist($;$) {
+    my($path, $from_host) = @_;
+    my @rawpath;
+    my($curdir, $updir);
+
+    if ($from_host) {
+	my @sp   = File::Spec->splitpath($path);
+	my $cp   = File::Spec->catpath(undef, $sp[1], $sp[2]);
+	@rawpath = File::Spec->splitdir($cp);
+	$curdir  = File::Spec->curdir();
+	$updir   = File::Spec->updir();
+    } else {
+	@rawpath = split(/[\/\\]+/, $path);
+	$curdir  = '.';
+	$updir   = '..';
+    }
+
+    my @path;
+    foreach my $rp (@rawpath) {
+	my $vn = $rp;
+	if ($rp eq '' || $rp eq $curdir) {
+	    next;
+	} elsif ($rp eq $updir) {
+	    pop(@path);
+	} else {
+	    my $vn = $rp;
+	    # Normalize name
+	    $vn =~ s/^\s+//;
+	    $vn =~ s/\s+$//;
+	    $vn =~ s/^(\.|\s+|$)/_/;
+	    $vn =~ tr/\"\*\/:<>?\\|/\'+;()!!/;
+	    push(@path, $vn);
+	}
+    }
+
+    if (!scalar(@path)) {
+	die "$0: empty path?: \"$path\"";
+    }
+
+    return @path;
+}
+
+# Error counter
+my $err = 0;
+
+# Directory entry types, and lists of nodes of each type
+my $FILE = 1;
+my $DIR  = 2;
+my @nodes = (undef, [], []);
+
+# Creates or finds a node in the directory tree from a list of names
+# and returns a reference to it
+sub mktreenode($@) {
+    my($root, @path) = @_;
+
+    my $here = $root;
+
+    foreach my $p (@path) {
+	my $herepath = $here->{path};
+
+	if (!$here->{type}) {
+	    $here->{type}  = $DIR;
+	    $here->{files} = {};
+	    push(@{$nodes[$DIR]}, $here);
+	} elsif ($here->{type} ne $DIR) {
+	    print STDERR "$outfile: file and directory conflict: $herepath\n";
+	    $err++;
+	    return undef;
+	}
+
+	my $f = $p;
+	utf8::upgrade($f);
+
+	my $there = $here;
+	$here = $there->{files}->{$f};
+	if (!defined($here)) {
+	    # New directory entry, unknown type so far
+	    $here = {'name' => $f, 'path' => $herepath.'/'.$f};
+	    $there->{files}->{$f} = $here;
+	}
+    }
+
+    return $here;
+}
+
+sub inputnode($$) {
+    my($root, $inpath) = @_;
+
+    my $dest;
+    my @dest;
+    if ($inpath =~ /^(.*)::(.*)$/) {
+	$inpath = $1;
+	$dest   = $2;
+    }
+
+    my @st = stat($inpath);
+    if (!scalar(@st)) {
+	print STDERR "$inpath: path not found\n";
+	$err++;
+	return;
+    }
+
+    if (!defined($dest)) {
+	@dest = ();
+    } elsif ($dest eq '') {
+	@dest = pathlist($inpath, 1);
+    } else {
+	@dest = pathlist($dest, 0);
+    }
+
+    $dest = mktreenode($root, @dest);
+    $dest->{inpath} = $inpath if (defined($dest));
+
+    return $dest;
+}
+
+# Create the root directory node
+sub rootdir() {
+    my $root = { 'path' => '', 'type' => $DIR, 'files' => {} };
+    push(@{$nodes[$DIR]}, $root);
+    return $root;
+}
+
+# Append a name to a directory path in host space
+sub cat_path($$) {
+    my($dir, $file) = @_;
+
+    my @sp = File::Spec->splitpath($dir);
+    $sp[1] = ($sp[1] eq '' || $sp[1] eq File::Spec->curdir)
+	? $sp[2] : File::Spec->catdir($sp[1], $sp[2]);
+    $sp[2] = $file;
+    return File::Spec->catpath(@sp);
+}
+
+# Add an input file or directory to a directory node
+sub add_input($;$) {
+    my($dest, $inpath) = @_;
+    return undef unless (defined($dest));
+
+    if (defined($inpath)) {
+	$dest->{inpath} = $inpath;
+    } else {
+	$inpath = $dest->{inpath};
+    }
+
+    my @st = stat($inpath);
+
+    if (!scalar(@st)) {
+	print STDERR "$outfile: input not found: $inpath\n";
+	return;
+    }
+
+    my $mode = $st[2];
+
+    if (S_ISDIR($mode)) {
+	if (!$dest->{type}) {
+	    $dest->{type} = $DIR;
+	    $dest->{files} = {};
+	    push(@{$nodes[$DIR]}, $dest);
+	} elsif ($dest->{type} != $DIR) {
+	    printf STDERR "%s: file and directory conflict: %s\n",
+		$outfile, $dest->{path};
+	    $err++;
+	    return;
+	}
+	my $dh;
+	if (!opendir($dh, $dest->{inpath})) {
+	    printf STDERR "%s: cannot scan input directory: %s: %s\n",
+		$outfile, $dest->{inpath}, $!;
+	    $err++;
+	    return;
+	}
+	while (defined(my $de = readdir($dh))) {
+	    next if ($de eq File::Spec->curdir() || $de eq File::Spec->updir());
+	    my $node = mktreenode($dest, $de);
+	    add_input($node, cat_path($inpath, $de));
+	}
+	closedir($dh);
+    } elsif (S_ISREG($mode)) {
+	if ($dest->{type}) {
+	    printf STDERR "%s: file%s conflict: %s\n",
+		$outfile, $dest->{type} eq $DIR ? ' and directory' : '',
+		$dest->{path};
+	    $err++;
+	    return;
+	}
+	$dest->{type} = $FILE;
+	$dest->{size} = $st[7];
+	push(@{$nodes[$FILE]}, $dest);
+    } else {
+	printf STDERR "$outfile: skipping non-regular file: $inpath\n";
+	$err++;
+	return;
+    }
+}
+
+sub gendirsizes() {
+    foreach my $d (@{$nodes[$DIR]}) {
+	my $e = 2; # . and .., or label
+	# One entry for each 13 UTF-16 codepoints, plus one
+	foreach my $f (keys(%{$d->{files}})) {
+	    my $u = encode($FATUNI, $f, Encode::LEAVE_SRC);
+	    $e += (length($u)+25+26)/26;
+	}
+
+	# Round up to a sector size (16 entries)
+	$e = align_up($e, 16);
+	$d->{size} = $e << 5;
+    }
+}
+
+# These functions are allowed to overcount, but not undercount
+
+sub count_clusters($) {
+    my($cshift) = @_;
+    my $clust = 0;
+
+    $cshift += 9;		# sectors to bytes
+    my $csize = 1 << $cshift;
+
+    foreach my $f (@{$nodes[$FILE]}, @{$nodes[$DIR]}) {
+	$clust += ($f->{size} + $csize - 1) >> $cshift;
+    }
+
+    return $clust;
+}
+
+sub get_format_params($$) {
+    my($root, $cshift) = @_;
+    my $csize = 1 << $cshift;
+
+    my $c = count_clusters($cshift);
+    my $fattype;
+    my $nfats = 2;
+
+    my $sectors = $c << $cshift;
+
+    # Nybbles! per FAT entry (using bits here can cause overflow
+    # on 32-bit platforms.)
+    if ($c < 0xff5) {
+	# FAT12
+	$fattype = 12;
+    } elsif ($c < 0xfff5) {
+	# FAT16
+	$fattype = 16;
+    } elsif ($c < 0x0ffffff5) {
+	# FAT32
+	$fattype = 32;
+	# Require cluster size >= 4096 and size 512MiB+; some
+	# versions of Windows apparently have problems othersie
+	return undef if ($cshift < 3 || $sectors < 512*2048);
+    } else {
+	# Invalid cshift; filesystem doesn't fit
+	return undef;
+    }
+
+    # Size of each FAT in bytes
+    my $fatsize = (($c+2) * $fattype + 1) >> 3;
+
+    # Assume each FAT is padded to a cluster size.
+    $fatsize = align_up($fatsize, $csize << 9) >> 9;
+    $sectors += $nfats*$fatsize;
+
+    # Reserved sectors
+    my $resv = max(($fattype < 8) ? 1 : 32, $csize);
+    $sectors += $resv;
+
+    # Root directory size. The size of the root directory is already
+    # accounted for in the cluster count, even though FAT12/16 does
+    # not give them cluster numbers (so can overcount the FAT size slightly,
+    # that is OK.
+    my $rootdirent = align_up($root->{size}, $csize) >> 5;
+
+    # Generated filesystem image parameters. May be an overestimate.
+    return [$sectors, $cshift, $fattype, $resv, $nfats, $fatsize,
+	    $rootdirent, $c];
+}
+
+sub read_inputs(@) {
+    my(@inputs) = @_;
+
+    my $root = rootdir();
+
+    foreach my $input (@inputs) {
+	add_input(inputnode($root, $input));
+    }
+
+    return $root;
+}
+
+my $nullfh;
+
+sub vsystem(@) {
+    my @cmd = grep { defined($_) } @_;
+    my $cmd = join(' ', @cmd);
+    if ($verbose) {
+	print STDERR $cmd, "\n";
+    }
+
+    STDOUT->flush;
+    STDERR->flush;
+
+    # Especially mkdosfs is needlessly verbose, so redirect stdout
+    # and stderr to /dev/null unless verbose
+    my $pid;
+
+    if ($verbose) {
+	$pid = open3(['&',0], ['&',1], ['&',2], @cmd);
+    } else {
+	$pid = open3(['&',0], ['&',$nullfh], undef, @cmd);
+    }
+
+    waitpid($pid, 0);
+
+    my $sys = $?;
+    if ($sys) {
+	die "$0: command $cmd failed: $sys\n";
+    }
+    return $sys;
+}
+
+sub pp_file {
+    my($f) = @_;
+    vsystem('mcopy', '-m', '-D', 'o', '-D', 'A',
+	    $f->{inpath}, 'z:'.$f->{path});
+}
+sub pp_dir {
+    my($f) = @_;
+    vsystem('mmd', 'z:'.$f->{path});
+}
+
+# Note: this does NOT process the root directory!
+sub populate_with($$$) {
+    my($dir, $type, $what) = @_;
+    my @dents = sort { $a->{name} cmp $b->{name} } values(%{$dir->{files}});
+
+    foreach my $de (@dents) {
+	$what->($de) if ($de->{type} == $type);
+	populate_with($de, $type, $what) if ($de->{type} == $DIR);
+    }
+}
+
+sub make_filesystem($) {
+    my($root) = @_;
+
+    gendirsizes();
+
+    # Compute a suitable cluster shift.
+    my $bestparm = undef;
+    my @csparm;
+    for (my $cs = 0; $cs < 7; $cs++) {
+	my $parm = get_format_params($root, $cs);
+	push(@csparm, $parm);
+	next unless (defined($parm));
+	if ($verbose >= 2) {
+	    printf STDERR "clust %3d: FAT%d, sectors %8d, clust %8d\n",
+		1 << $cs, $parm->[2], $parm->[0], $parm->[7];
+	}
+	if (!defined($bestparm) || ($parm->[0] < $bestparm->[0])) {
+	    $bestparm = $parm;
+	}
+	# Avoid 128-sector clusters unless we really need them
+	last if (defined($bestparm) && $cs >= 6);
+    }
+
+    die "$outfile: filesystem too large\n" unless (defined($bestparm));
+
+    # Cluster bytes
+    my $csectors = 1 << $bestparm->[1];
+
+    # Block alignment in sectors
+    my $align    = max($csectors, 2);
+    my $gptsize  = 1;		# In sectors, standard = 32
+    my $startsec = align_up($gptsize+2, $align); # +2 for PMBR, header
+
+    # Initial gpt + alignent + and 33 sectors for backup gpt.
+    # mkdosfs takes size input in 1K blocks, but also rounds the size
+    # down to a multiple of the "track size", so let that also be 2...
+    my $minfssec = align_up($bestparm->[0],2);
+    my $sectors = $minfssec + $startsec + ($gptsize+1);
+    $sectors  = align_up($sectors, $align);
+    my $fssec = $sectors - $startsec - ($gptsize+1);
+
+    # Construct a fake geometry just for the heck of it, and because
+    # mkdosfs rounds the filesystem size down to a multiple of the
+    # "track" size.
+    # ~1 to cope with mkdosfs taking units of 1K
+    my @hs = (255, 63);
+    for ($hs[1] = 63; $hs[1] > 1; $hs[1]--) {
+	last if (align_down($fssec & ~1, $hs[1]) >= $minfssec);
+    }
+
+    # Create the empty image. O_RDWR|O_APPEND is required on Windows,
+    # hence this really weird combinations of flags.
+    sysopen(my $out, $outfile, O_RDWR|O_TRUNC|O_CREAT|O_APPEND, 0666)
+	or die "$outfile: $!\n";
+    $out->autoflush(1);
+
+    # Create the GPT partition table
+    my @gpt = gen_gpt($sectors, $startsec, $fssec, $efi_system_type,
+		      $gptsize, \@hs);
+
+    print $out $gpt[0], $gpt[1], $gpt[3];
+
+    # Pad the file for mkdosfs
+    truncate($out, ($startsec + $fssec) << 9);
+
+    # Create the filesystem
+    vsystem('mkdosfs', $verbose ? ('-v') : (),
+	    '-n', substr($volname, 0, 11),
+	    '-F', $bestparm->[2],
+	    '-S', 512, '-s', 1 << $bestparm->[1],
+	    '-g', $hs[0].'/'.$hs[1],
+	    '--offset', $startsec, '-f', $bestparm->[4],
+	    '-R', $bestparm->[3],
+	    $bestparm->[2] < 32 ? ('-r', $bestparm->[6]) : (),
+	    '-h', $startsec, $outfile, $fssec >> 1);
+
+    # Create a mtools configuration file
+    my($mt, $mtoolsrc) = tempfile(TMPDIR => 1);
+    print  $mt "MTOOLS_FAT_COMPATIBILITY=1\n";
+    print  $mt "drive z:\n";
+    printf $mt " file=\"%s\"", $outfile;
+    printf $mt " offset=%d\n", $startsec << 9;
+    print  $mt " mformat_only\n";
+    close($mt);
+
+    $ENV{'MTOOLSRC'} = $mtoolsrc;
+
+    # Populate the output filesystem; directory hierarchy first
+    populate_with($root, $DIR,  \&pp_dir);
+    populate_with($root, $FILE, \&pp_file);
+
+    unlink($mtoolsrc);
+
+    # Finally, output the backup GPT
+    print $out $gpt[3], $gpt[2];
+    close($out);
+}
+
+die "$0: needs a 64-bit integer Perl interpreter\n" unless (1 << 63);
+
+open($nullfh, '+>', File::Spec->devnull);
+
+my $root = read_inputs(@inputs);
+exit(1) if ($err);
+
+make_filesystem($root);

@@ -1,18 +1,21 @@
 #!/usr/bin/perl
+# <add SPDX header here>
+# Copyright 2025 Intel Corporation
 
 use strict;
 use integer;
+use v5.16;
 use utf8;
-use feature qw(unicode_strings);
+no indirect;
 
-use Encode qw(encode decode);
-use File::Spec;
+use Crypt::Random::Source;
+use Digest::CRC qw(crc32);
+use Encode;
 use Fcntl qw(:DEFAULT :mode);
+use File::Spec;
 use File::Temp qw(tempfile);
 use IO::Handle;
 use IPC::Open3;
-use Crypt::Random::Source;
-use Digest::CRC qw(crc32);
 
 my $verbose = $ENV{'V'};
 my $volname = $ENV{'VOLNAME'} || 'EFI BOOT';
@@ -30,22 +33,14 @@ EOF
 
 # The FAT and GPT Unicode encoding
 my $FATUNI = Encode::find_encoding('UTF-16LE');
-my $FATOEM = Encode::find_encoding('IBM-850');
 my $NATIVE = Encode::find_encoding('utf8'); # Hope so?
 
+# Convert a string to "Unicode" (UTF-16LE) as used by FAT and EFI
 sub to_uni($) {
     my($s) = @_;
     Encode::from_to($s, $NATIVE, $FATUNI);
     return $s;
 }
-sub to_oem($) {
-    my($s) = @_;
-    Encode::from_to($s, $NATIVE, $FATOEM);
-    return $s;
-}
-
-# Null filehandle, useful to have
-open(my $nullfh, '+>', File::Spec->devnull);
 
 sub min(@) {
     my $x;
@@ -588,35 +583,6 @@ sub emit_one_fat($) {
     return $bytes;
 }
 
-sub vsystem(@) {
-    my @cmd = grep { defined($_) } @_;
-    my $cmd = join(' ', @cmd);
-    if ($verbose) {
-	print STDERR $cmd, "\n";
-    }
-
-    STDOUT->flush;
-    STDERR->flush;
-
-    # Especially mkdosfs is needlessly verbose, so redirect stdout
-    # and stderr to /dev/null unless verbose
-    my $pid;
-
-    if ($verbose) {
-	$pid = open3(['&',0], ['&',1], ['&',2], @cmd);
-    } else {
-	$pid = open3(['&',0], ['&',$nullfh], undef, @cmd);
-    }
-
-    waitpid($pid, 0);
-
-    my $sys = $?;
-    if ($sys) {
-	die "$0: command $cmd failed: $sys\n";
-    }
-    return $sys;
-}
-
 # Maximum chunk size for writezero() and emit_file()
 my $BUFSIZ = 1024*1024;
 
@@ -645,39 +611,45 @@ sub emitzero($$) {
     return $bytes;
 }
 
-# Generate a short filename. For simplicity, only consider ASCII
-# characters as valid shortname characters. $shorthash is a reference
-# to an hash for the directory within which the conversion is happening.
+# Generate a short filename. For simplicity, only consider
+# non-whitespace ASCII characters as valid shortname characters, even
+# though that is needlessly strict. This also avoids the special handling
+# of 0xe5 as the first byte. $shorthash is a reference to a
+# hash for the directory within which the conversion is happening.
+
+# For each string reference in the list, strip invalid shortname
+# characters (including .) in place and return 1 if the conversion was
+# inexact except for case.
+sub to_valid_shortchar(@) {
+    my $inexact = 0;
+    foreach my $i (@_) {
+	$$i = uc($$i);
+	$inexact = 1 if ($$i =~ s/[^!\#-\)\-0-9\@-Z^-\{\}~]+/_/g);
+    }
+    return $inexact;
+}
+
 sub genshortname($$) {
     my($fullname, $shorthash) = @_;
 
-    my $name = uc($fullname);
-    my $head;
-    my $ext;
+    $fullname =~ /^(.*?)(?:\.([^.]+))?$/;
+    my $head = $1;
+    my $ext  = $2;
+    my $inexact = to_valid_shortchar(\$head, \$ext);
 
-    if ($name =~ /^([~A-Z0-9\$\%\'_\@\`!(){}^\#\&-]{1,8})(?:\.([~A-Z0-9\$\%\'_~\@\`!()e{}^\#\&-]{1,3}))?$/) {
-	# Exact conversion possible
-	my $xname = pack('A8A3', $1, $2);
+    $inexact = 1 if ($head eq '' || length($head) > 8);
+    $inexact = 1 if (length($ext) > 3);
+
+    for (my $ctr = $inexact; $ctr <= 99999; $ctr++) {
+	my $ctrtail = $ctr ? '~'.$ctr : '';
+	my $xhead = substr($head, 0, 8-length($ctrtail));
+	my $xname = pack('A8A3', $xhead.$ctrtail, $ext);
 	if (!defined($shorthash->{$xname})) {
+	    if ($verbose >= 3) {
+		print STDERR "$outfile: short \"$xname\" for \"$fullname\"\n";
+	    }
 	    $shorthash->{$xname} = $fullname;
 	    return $xname;
-	}
-    }
-
-    $name =~ s/[^\.~A-Z0-9\$\%\'_\@\`!(){}^\#\&-]/_/g;
-    $name =~ s/^\./_/;
-    $name =~ s/\.$/_/;
-
-    die unless ($name =~ /^(.+?)(?:\.([^.]+))$/);
-    my $head = substr($1, 0, 8);
-    my $ext  = substr($2, 0, 3);
-
-    for (my $ctr = 1; $ctr <= 99999; $ctr++) {
-	$head = substr($head, 0, 7-length($ctr)) . '~' . $ctr;
-	$name = pack('A8A3', $head, $ext);
-	if (!defined($shorthash->{$name})) {
-	    $shorthash->{$name} = $fullname;
-	    return $name;
 	}
     }
 
@@ -912,9 +884,11 @@ sub emit_superblock($$) {
 sub create_vol_label($$) {
     my($root, $vol) = @_;
 
-    $root->{volname}  = $vol;
-    $root->{shortvol} = pack('A11', to_oem($vol));
     $root->{volid}    = unpack('V', rand_bytes(4));
+    $root->{volname}  = $vol;
+
+    $vol =~ s/[^ -~]+/_/g;	# Mangle non-ASCII
+    $root->{shortvol} = pack('A11', $vol);
 }
 
 sub make_filesystem($) {

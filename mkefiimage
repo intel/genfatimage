@@ -31,15 +31,16 @@ Usage: $0 outfile input_path[::[destination]] ...
 EOF
 }
 
+# Hopefully correct...
+binmode(STDERR, ':encoding(UTF-8)');
+
 # The FAT and GPT Unicode encoding
 my $FATUNI = Encode::find_encoding('UTF-16LE');
-my $NATIVE = Encode::find_encoding('utf8'); # Hope so?
 
 # Convert a string to "Unicode" (UTF-16LE) as used by FAT and EFI
 sub to_uni($) {
     my($s) = @_;
-    Encode::from_to($s, $NATIVE, $FATUNI);
-    return $s;
+    return Encode::encode($FATUNI, $s, Encode::LEAVE_SRC);
 }
 
 sub min(@) {
@@ -103,8 +104,9 @@ sub rand_guid() {
 my $efi_system_type
     = guid(0xc12a7328, 0xf81f, 0x11d2, 0xba4b, 0x00a0c93ec93b);
 
-sub gen_gpt($$$;$$$) {
-    my($disk_len, $part_start, $part_len, $part_type, $gpt_len, $hs) = @_;
+sub gen_gpt($$$;$$$$) {
+    my($disk_len, $part_start, $part_len, $part_type,
+       $part_name, $gpt_len, $hs) = @_;
     my @blks = (undef) x 4;
 
     $part_type = $efi_system_type unless (defined($part_type));
@@ -130,7 +132,7 @@ sub gen_gpt($$$;$$$) {
     # GPT partition array
     $blks[3] = $part_type . rand_guid() .
 	pack('Q<Q<Q<a142v', $part_start, $part_start + $part_len - 1, 1,
-	     to_uni($volname), 0);
+	     to_uni($part_name), 0);
     $blks[3] .= ("\0" x (512*$gpt_len - length($blks[3])));
     my $array_crc = crc32($blks[3]);
 
@@ -190,13 +192,7 @@ sub pathlist($;$) {
 	} elsif ($rp eq $updir) {
 	    pop(@path);
 	} else {
-	    my $vn = $rp;
-	    # Normalize name
-	    $vn =~ s/^\s+//;
-	    $vn =~ s/\s+$//;
-	    $vn =~ s/^(\.|\s+|$)/_/;
-	    $vn =~ tr/\"\*\/:<>?\\|/\'+;()!!/;
-	    push(@path, $vn);
+	    push(@path, $rp);
 	}
     }
 
@@ -211,10 +207,24 @@ sub pathlist($;$) {
 my $err = 0;
 
 # Directory entry types, and lists of nodes of each type
+# Important: $VOL < $DIR < $FILE
 my $VOL  = 0x08;
 my $DIR  = 0x10;
 my $FILE = 0x20;		# == ARCHIVE bit
 my %nodes = ($DIR => [], $FILE => []);
+
+# Normalize a filename coming from host space stripping things
+# unsuitable for the FAT longname and forcing Perl to convert
+# a string to characters rather than bytes
+sub normalize_filename($) {
+    my($vn) = @_;
+    # Normalize name; this affects the retained name
+    $vn = decode_utf8($vn);	# Convert to characters
+    $vn =~ s/^\./_/;
+    $vn =~ s/[\s\.]$/_/;
+    $vn =~ tr/\"\*\/:<>?\\|/\'+;()!!/;
+    return $vn;
+}
 
 # Creates or finds a node in the directory tree from a list of names
 # and returns a reference to it
@@ -237,15 +247,14 @@ sub mktreenode($@) {
 	    return undef;
 	}
 
-	my $f = $p;
-	utf8::upgrade($f);
-
+	my $f = normalize_filename($p);
+	my $uf = uc($f);
 	my $there = $here;
-	$here = $there->{files}->{$f};
+	$here = $there->{files}->{$uf};
 	if (!defined($here)) {
 	    # New directory entry, unknown type so far
 	    $here = {'up' => $there, 'name' => $f, 'path' => $herepath.'/'.$f};
-	    $there->{files}->{$f} = $here;
+	    $there->{files}->{$uf} = $here;
 	}
     }
 
@@ -285,7 +294,8 @@ sub inputnode($$) {
 
 # Create the root directory node
 sub rootdir() {
-    my $root = { 'path' => undef, 'type' => $DIR, 'files' => {} };
+    my $root = { 'path' => undef, 'name' => undef, 'date' => time(),
+		 'type' => $DIR, 'files' => {} };
     push(@{$nodes{$DIR}}, $root);
     return $root;
 }
@@ -306,11 +316,7 @@ sub add_input($;$) {
     my($dest, $inpath) = @_;
     return undef unless (defined($dest));
 
-    if (defined($inpath)) {
-	$dest->{inpath} = $inpath;
-    } else {
-	$inpath = $dest->{inpath};
-    }
+    $inpath = $dest->{inpath} unless (defined($inpath));
 
     my @st = stat($inpath);
 
@@ -320,24 +326,24 @@ sub add_input($;$) {
     }
     my $mode = $st[2];
 
-    $dest->{date}  = $st[9];
-    $dest->{flags} = !($mode & S_IWRITE); # Readonly bit
+    $dest->{date}  = $st[9] if ($st[9] > $dest->{date});
 
     if (S_ISDIR($mode)) {
 	if (!$dest->{type}) {
 	    $dest->{type} = $DIR;
 	    $dest->{files} = {};
+	    $dest->{inpath} = $inpath;
 	    push(@{$nodes{$DIR}}, $dest);
 	} elsif ($dest->{type} != $DIR) {
-	    printf STDERR "%s: file and directory conflict: %s\n",
-		$outfile, $dest->{path};
+	    printf STDERR "%s: file and directory conflict: %s (%s and %s)\n",
+		$outfile, $dest->{path}, $dest->{inpath}, $inpath;
 	    $err++;
 	    return;
 	}
 	my $dh;
-	if (!opendir($dh, $dest->{inpath})) {
+	if (!opendir($dh, $inpath)) {
 	    printf STDERR "%s: cannot scan input directory: %s: %s\n",
-		$outfile, $dest->{inpath}, $!;
+		$outfile, $inpath, $!;
 	    $err++;
 	    return;
 	}
@@ -349,14 +355,16 @@ sub add_input($;$) {
 	closedir($dh);
     } elsif (S_ISREG($mode)) {
 	if ($dest->{type}) {
-	    printf STDERR "%s: file%s conflict: %s\n",
+	    printf STDERR "%s: file%s conflict: %s (%s and %s)\n",
 		$outfile, $dest->{type} eq $DIR ? ' and directory' : '',
-		$dest->{path};
+		$dest->{path}, $dest->{inpath}, $inpath;
 	    $err++;
 	    return;
 	}
-	$dest->{type} = $FILE;
-	$dest->{size} = $st[7];
+	$dest->{type}   = $FILE;
+	$dest->{size}   = $st[7];
+	$dest->{inpath} = $inpath;
+	$dest->{flags}  = !($mode & S_IWRITE); # Readonly bit
 	push(@{$nodes{$FILE}}, $dest);
     } else {
 	printf STDERR "$outfile: skipping non-regular file: $inpath\n";
@@ -380,19 +388,91 @@ sub read_inputs(@) {
     return $root;
 }
 
-sub gendirsizes() {
+# Convert a longname to UTF-16LE and pad it
+sub genlongname($) {
+    my($s) = @_;
+
+    my $u = substr(to_uni($s), 0, 255 << 1);
+    my $p = (length($u) >> 1) % 13;
+
+    if ($p) {
+	$u .= "\0\0";
+	$u .= "\xff\xff" x (12-$p);
+    }
+    return $u;
+}
+
+# Generate a short filename. For simplicity, only consider
+# non-whitespace ASCII characters as valid shortname characters, even
+# though that is needlessly strict. This also avoids the special handling
+# of 0xe5 as the first byte. $shorthash is a reference to a
+# hash for the directory within which the conversion is happening.
+
+# For each string reference in the list, strip invalid shortname
+# characters (including .) in place and return 1 if the conversion was
+# inexact except for case.
+sub to_valid_shortchar(@) {
+    my $inexact = 0;
+    foreach my $i (@_) {
+	$$i = uc($$i);
+	$inexact = 1 if ($$i =~ s/[^!\#-\)\-0-9\@-Z^-\{\}~]+/_/g);
+    }
+    return $inexact;
+}
+
+sub genshortname($$$) {
+    my($fullname, $shorthash, $type) = @_;
+    if ($type & $VOL) {
+	# The rules for volume labels are much less strict
+	(my $lbl = $fullname) =~ s/[^ -~]/_/g;
+	return pack('A11', $lbl);
+    }
+
+    # If this doesn't match then the name is empty...
+    die unless ($fullname =~ /^(.+?)(?:\.([^.]+))?$/);
+    my $head = $1;
+    my $ext  = $2;
+    my $inexact = to_valid_shortchar(\$head, \$ext);
+
+    $inexact = 1 if ($head eq '' || length($head) > 8);
+    $inexact = 1 if (length($ext) > 3);
+
+    for (my $ctr = $inexact; $ctr <= 99999; $ctr++) {
+	my $ctrtail = $ctr ? '~'.$ctr : '';
+	my $xhead = substr($head, 0, 8-length($ctrtail));
+	my $xname = pack('A8A3', $xhead.$ctrtail, $ext);
+	if (!defined($shorthash->{$xname})) {
+	    if ($verbose >= 2) {
+		print STDERR "$outfile: short \"$xname\" for \"$fullname\"\n";
+	    }
+	    $shorthash->{$xname} = $fullname;
+	    return $xname;
+	}
+    }
+
+    die "$outfile: directory too long\n";
+}
+
+# Compute directory sizes and generate the sorted list of
+# directory entries, and assign long and short names
+sub prep_directories($) {
+    my($root) = @_;
+
     foreach my $d (@{$nodes{$DIR}}) {
-	my $e = defined($d->{up}) ? 2 : 0;
+	my @filelist = sort {
+	    $a->{type} <=> $b->{type} || $a->{name} cmp $b->{name}
+        } values(%{$d->{files}});
+	$d->{filelist} = \@filelist;
+
+	my $e = defined($d->{up}) ? 2 : 0; # . and .. for non-root
+	my %shorthash;
 
 	# One entry for each 13 UTF-16 codepoints, plus one
-	foreach my $f ($d->{volname}, keys(%{$d->{files}})) {
-	    next unless (defined($f));
-	    my $u = to_uni($f);
-	    $e += (length($u)+25+26)/26;
+	foreach my $f (@filelist) {
+	    $f->{longname} = genlongname($f->{name});
+	    $f->{shortname} = genshortname($f->{name}, \%shorthash, $f->{type});
+	    $e += length($f->{longname})/26 + 1;
 	}
-
-	# Round up to a sector size (16 entries)
-	$e = align_up($e, 16);
 	$d->{size} = $e << 5;
     }
 }
@@ -475,6 +555,8 @@ sub finalize_format_params($$$$) {
 	$prefixsec += $root->{paddedsize} >> $parm->{secshift};
     }
 
+    $parm->{data} = $startsec + $prefixsec;
+
     # Compute the final size of the filesystem
     my $fattypemax = (1 << $parm->{fattype}) - 12;
     my $fatsizemax = ($parm->{fatsize} << ($parm->{secshift} + 3))
@@ -485,33 +567,69 @@ sub finalize_format_params($$$$) {
     $parm->{sectors} = $prefixsec + ($parm->{clust} << $parm->{cshift});
 }
 
-# Assign final cluster numbers and padded sizes to files and directories
-sub assign_clusters($) {
-    my($parm) = @_;
-    my $csize  = $parm->{cbytes};
-    my $cshift = $parm->{cbshift};
+# This walks the *subnodes* of a node of a certain type
+sub populate_with($$$$) {
+    my($dir, $parm, $type, $what) = @_;
+    my $ret = 0;
 
-    # The root directory is always first in @{$nodes{$DIR}}
-    my $fat1216_root = $parm->{fattype} < 32;
-
-    my $clustno = 2;		# First "real" cluster number
-
-    foreach my $f (@{$nodes{$DIR}}, @{$nodes{$FILE}}) {
-	$f->{paddedsize} = align_up($f->{size}, $csize);
-	$f->{nclust} = $f->{paddedsize} >> $cshift;
-	if (!$f->{nclust} || $fat1216_root) {
-	    # Zero-length file or the FAT12/16 root directory
-	    # For the latter, {nclust} is still assigned
-	    $f->{clustno} = 0;
-	    $fat1216_root = 0;
-	} else {
-	    $f->{clustno} = $clustno;
-	    $clustno += $f->{nclust};
+    foreach my $de (@{$dir->{filelist}}) {
+	if ($de->{type} == $type) {
+	    $ret += $what->($de, $parm);
+	}
+	if ($de->{type} == $DIR) {
+	    $ret += populate_with($de, $parm, $type, $what);
 	}
     }
 
-    die if ($clustno > $parm->{clust} + 2);
-    return $parm->{endclust} = $clustno;
+    return $ret;
+}
+
+# Assign cluster number to one file node
+sub assign_clust($$) {
+    my($f, $parm) = @_;
+
+    $f->{paddedsize} = align_up($f->{size}, $parm->{cbytes});
+    $f->{nclust} = $f->{paddedsize} >> $parm->{cbshift};
+    if (!$f->{nclust}) {
+	$f->{clustno} = 0;
+    } else {
+	$f->{clustno} = $parm->{endclust};
+	$parm->{endclust} += $f->{nclust};
+	push(@{$parm->{layout}}, $f);
+	if ($verbose >= 3) {
+	    printf STDERR "%s: cluster %5d @ 0x%08x (len %5d) for \"%s\"\n",
+		$outfile, $f->{clustno},
+		($f->{data} << $parm->{secshift}) +
+		(($f->{clustno}-2) << $parm->{cshift}),
+		$f->{nclust}, $f->{path};
+	}
+    }
+
+    return $f->{endclust};
+}
+
+# Assign final cluster numbers and padded sizes to files and directories
+sub assign_clusters($$) {
+    my($root, $parm) = @_;
+
+    # This will contain the non-empty nodes in layout order
+    $parm->{layout} = [];
+
+    # These must be run in the same order as the final population,
+    # so use the populate_with() helpers here too.
+    if ($parm->{fattype} < 32) {
+	# The root directory doesn't use "real" clusters
+	$parm->{endclust} = 0;
+	assign_clust($root, $parm);
+	$parm->{endclust} = 2;
+    } else {
+	$parm->{endclust} = 2;
+	assign_clust($root, $parm);
+    }
+    populate_with($root, $parm, $DIR,  \&assign_clust);
+    populate_with($root, $parm, $FILE, \&assign_clust);
+
+    die if ($parm->{endclust} > $parm->{clust} + 2);
 }
 
 # Emit one FAT entry. $hold should be a reference to a scalar
@@ -562,7 +680,7 @@ sub emit_one_fat($) {
     $bytes += $emit->($out, -1, \$hold);
 
     my $clustno = 2;
-    foreach my $f (@{$nodes{$DIR}}, @{$nodes{$FILE}}) {
+    foreach my $f (@{$parm->{layout}}) {
 	next if (!$f->{clustno});		# No cluster chain
 	die if ($f->{clustno} != $clustno);	# This would be bad...
 	my $nclust = $f->{nclust};
@@ -611,51 +729,6 @@ sub emitzero($$) {
     return $bytes;
 }
 
-# Generate a short filename. For simplicity, only consider
-# non-whitespace ASCII characters as valid shortname characters, even
-# though that is needlessly strict. This also avoids the special handling
-# of 0xe5 as the first byte. $shorthash is a reference to a
-# hash for the directory within which the conversion is happening.
-
-# For each string reference in the list, strip invalid shortname
-# characters (including .) in place and return 1 if the conversion was
-# inexact except for case.
-sub to_valid_shortchar(@) {
-    my $inexact = 0;
-    foreach my $i (@_) {
-	$$i = uc($$i);
-	$inexact = 1 if ($$i =~ s/[^!\#-\)\-0-9\@-Z^-\{\}~]+/_/g);
-    }
-    return $inexact;
-}
-
-sub genshortname($$) {
-    my($fullname, $shorthash) = @_;
-
-    $fullname =~ /^(.*?)(?:\.([^.]+))?$/;
-    my $head = $1;
-    my $ext  = $2;
-    my $inexact = to_valid_shortchar(\$head, \$ext);
-
-    $inexact = 1 if ($head eq '' || length($head) > 8);
-    $inexact = 1 if (length($ext) > 3);
-
-    for (my $ctr = $inexact; $ctr <= 99999; $ctr++) {
-	my $ctrtail = $ctr ? '~'.$ctr : '';
-	my $xhead = substr($head, 0, 8-length($ctrtail));
-	my $xname = pack('A8A3', $xhead.$ctrtail, $ext);
-	if (!defined($shorthash->{$xname})) {
-	    if ($verbose >= 3) {
-		print STDERR "$outfile: short \"$xname\" for \"$fullname\"\n";
-	    }
-	    $shorthash->{$xname} = $fullname;
-	    return $xname;
-	}
-    }
-
-    die "$outfile: directory too long\n";
-}
-
 sub dosdate($) {
     my($time) = @_;
 
@@ -697,16 +770,8 @@ sub dir_shortent($$$$$) {
 		$clustno >> 16, $datetime, $clustno & 0xffff, $size);
 }
 
-sub dir_longent($$;$) {
-    my($name, $shortent, $maxlong) = @_;
-
-    $maxlong = 255 unless (defined($maxlong));
-
-    my @longname = unpack("v$maxlong", to_uni($name));
-    push(@longname, 0) if (scalar(@longname) % 13);
-    while (scalar(@longname) % 13) {
-	push(@longname, 0xffff);
-    }
+sub dir_longent($$) {
+    my($longname, $shortent) = @_;
 
     my $namesum = 0;
     foreach my $nb (unpack('C11', $shortent)) {
@@ -714,27 +779,30 @@ sub dir_longent($$;$) {
 	$namesum &= 0xff;
     }
 
-    my $longcnt = scalar(@longname)/13;
-    my $longctr = $longcnt | 0x40;
+    my $longpos = length($longname);
+    my $longctr = ($longpos/26) | 0x40;
     my $longent = '';
     while ($longctr) {
-	$longent .= pack('Cv5CCCv*', $longctr, @longname[-13...-9],
-			 0x0f, 0, $namesum, @longname[-8...-3],
-			 0, @longname[-2...-1]);
+	$longpos -= 26;
+	$longent .= pack('Ca10CCCa12va4', $longctr,
+			 substr($longname, $longpos, 10),
+			 0x0f, 0, $namesum,
+			 substr($longname, $longpos+10, 12),
+			 0,
+			 substr($longname, $longpos+22, 4));
 	$longctr = ($longctr & 0x3f) - 1;
-	delete @longname[-13...-1];
     }
 
     return $longent . $shortent;
 }
 
-sub emit_direntry($$$) {
-    my($f, $parm, $shorthash) = @_;
+sub emit_direntry($$) {
+    my($f, $parm) = @_;
 
     my $attr = ($f->{type} & ($DIR|$VOL)) | $f->{flags};
-    my $ent = dir_shortent(genshortname($f->{name}, $shorthash),
-			   $attr, node_date($f), $f->{clustno}, $f->{size});
-    $ent = dir_longent($f->{name}, $ent);
+    my $ent = dir_shortent($f->{shortname}, $attr, node_date($f),
+			   $f->{clustno}, $f->{size});
+    $ent = dir_longent($f->{longname}, $ent);
 
     return emit($parm->{out}, $ent);
 }
@@ -743,40 +811,30 @@ sub emit_direntry($$$) {
 sub emit_dir {
     my($dir, $parm) = @_;
     my $de;
-    my %shorthash;
+
+    my $up = $dir->{up};
+    my $bytes = 0;
 
     # Special entries at the beginning
-
-    my $dirdate = $dir->{date} = node_date($dir);
-    my $up = $dir->{up};
-
     if (defined($up)) {
 	# Not the root directory, emit . and ..
+	my $dirdate = $dir->{date} = node_date($dir);
+
 	$de  = dir_shortent('.',  $DIR, $dirdate, $dir->{clustno}, 0);
 
 	# For some stupid reasons .. is supposed to have 0 in the cluster
 	# pointer when it points to the root directory even on FAT32...
 	my $upptr = defined($up->{up}) ? $up->{clustno} : 0;
 	$de .= dir_shortent('..', $DIR, $dirdate, $upptr,  0);
-    } elsif (defined($dir->{volname})) {
-	# Root directory, emit label. Note that the label is not
-	# limited to 8.3 format, it is just 11 characters, and has to
-	# match the field in the boot sector.
-	$de = dir_shortent($dir->{shortvol}, $VOL, $dirdate, 0, 0);
-	$de = dir_longent($dir->{volname}, $de);
+	$bytes = emit($parm->{out}, $de);
     }
 
-    my $bytes = emit($parm->{out}, $de);
-
-    # Regular directory entries
-    my @files = sort {
-	$a->{type} <=> $b->{type} || $a->{name} cmp $b->{name}
-    } values(%{$dir->{files}});
-
-    foreach my $f (@files) {
-	$bytes += emit_direntry($f, $parm, \%shorthash);
+    # The regular directory entry list, already sorted
+    foreach my $f (@{$dir->{filelist}}) {
+	$bytes += emit_direntry($f, $parm);
     }
 
+    die if ($bytes != $dir->{size});
     $bytes += emitzero($parm->{out}, $dir->{paddedsize} - $bytes);
     return $bytes;
 }
@@ -793,8 +851,8 @@ sub emit_file {
     my $out = $parm->{out};
 
     my $in;
-    if (open($in, '<:raw', $f->{inpath})) {
-	binmode $in;
+    if (open($in, '<', $f->{inpath})) {
+	binmode($in);
 	while ($sizeleft) {
 	    my $buf;
 	    my $chunk = read($in, $buf, min($BUFSIZ, $sizeleft));
@@ -812,24 +870,6 @@ sub emit_file {
 
     $bytes += emitzero($out, $f->{paddedsize} - $bytes);
     return $bytes;
-}
-
-# Note: this does NOT process the $dir node itself
-sub populate_with($$$$) {
-    my($dir, $parm, $type, $what) = @_;
-    my @dents = sort { $a->{name} cmp $b->{name} } values(%{$dir->{files}});
-    my $ret = 0;
-
-    foreach my $de (@dents) {
-	if ($de->{type} == $type) {
-	    $ret += $what->($de, $parm);
-	}
-	if ($de->{type} == $DIR) {
-	    $ret += populate_with($de, $parm, $type, $what);
-	}
-    }
-
-    return $ret;
 }
 
 # Generate the FAT superblock
@@ -858,7 +898,7 @@ sub emit_superblock($$) {
     }
 
     $bs .= pack('CCCVA11A8', 0x80, 0, 0x29, $root->{volid},
-		$root->{shortvol}, "FAT$fat");
+		$root->{vollbl}->{shortname}, "FAT$fat");
 
     $bs .= ("\0" x (0x1f8 - length($bs)));
     $bs .= "\xcd\x18\xf4\xeb\xfb\0\x55\xaa";
@@ -884,18 +924,20 @@ sub emit_superblock($$) {
 sub create_vol_label($$) {
     my($root, $vol) = @_;
 
-    $root->{volid}    = unpack('V', rand_bytes(4));
-    $root->{volname}  = $vol;
-
-    $vol =~ s/[^ -~]+/_/g;	# Mangle non-ASCII
-    $root->{shortvol} = pack('A11', $vol);
+    $root->{volid} = unpack('V', rand_bytes(4));
+    $root->{vollbl} = {
+	'name' => decode_utf8($vol), 'type' => $VOL, 'up' => $root
+    };
+    if ($vol ne '') {
+	$root->{files}->{':vol'} = $root->{vollbl};
+    }
 }
 
 sub make_filesystem($) {
     my($root) = @_;
 
     create_vol_label($root, $volname);
-    gendirsizes();
+    prep_directories($root);
 
     # Compute a suitable cluster shift.
     my $parm = undef;
@@ -932,15 +974,22 @@ sub make_filesystem($) {
 
     # Update with the actually generated layout
     finalize_format_params($root, $parm, $startsec, $fssec);
-    assign_clusters($parm);
+    assign_clusters($root, $parm);
 
     # Output the image
-    open(my $out, '>', $outfile) or die "$outfile: $!\n";
-    binmode $out;
+    my $out;
+    if ($outfile eq '-') {
+	open($out, '&>', \*STDOUT);
+    } else {
+	open($out, '>', $outfile);
+    }
+    die "$outfile: $!\n" unless (defined($out));
+    binmode($out);
     $parm->{out} = $out;
 
     # Create the GPT partition table
     my @gpt = gen_gpt($sectors, $startsec, $fssec, $efi_system_type,
+		      $root->{vollbl}->{name},
 		      $gptsize, [$parm->{h}, $parm->{s}]);
 
     my $bytes = emit($out, $gpt[0], $gpt[1], $gpt[3]);
@@ -959,13 +1008,11 @@ sub make_filesystem($) {
     $bytes += populate_with($root, $parm, $DIR,  \&emit_dir);
     $bytes += populate_with($root, $parm, $FILE, \&emit_file);
 
-
     # Finally, output the backup GPT
     $bytes += emitzero($out, ($backupgpt << 9) - $bytes);
     $bytes += emit($out, $gpt[3], $gpt[2]);
 
     die unless ($bytes == ($sectors << 9));
-
     close($out);
 }
 

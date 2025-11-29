@@ -574,9 +574,13 @@ sub get_format_params($$) {
     $sectors += $resv;
 
     # The root directory, if not FAT32
+    my $rootdirsize;
     if ($fattype < 32) {
-	$root->{size} = min($resdir + $root->{size}, 4095 << 9);
-	$sectors += align_up($root->{size}, $balign) >> 9;
+	$rootdirsize = min($resdir + $root->{size}, 4095 << 9);
+	$rootdirsize = max($rootdirsize, $root->{size});
+	$rootdirsize = max($rootdirsize, 512 << 5) if ($opt{strict});
+	$rootdirsize = align_up($rootdirsize, $balign);
+	$sectors += $rootdirsize >> 9;
     }
 
     # Dummy geometry
@@ -597,7 +601,7 @@ sub get_format_params($$) {
     }
     # Generated filesystem image parameters. May be an overestimate.
     return {
-	'root' => $root,
+	'root' => $root, 'rootdirsize' => $rootdirsize,
 	'sectors' => $sectors, 'cshift' => $cshift,
 	'csectors' => 1 << $cshift, 'cbytes' => 512 << $cshift,
 	'cbshift' => $cshift + 9, 'fattype' => $fattype,
@@ -615,9 +619,7 @@ sub finalize_format_params($$$) {
     $parm->{hidden}  = $startsec;
 
     my $prefixsec = $parm->{resv} + $parm->{fatsize} * $parm->{nfats};
-    if (!$root->{clustno}) {
-	$prefixsec += $root->{paddedsize} >> $parm->{secshift};
-    }
+    $prefixsec += $parm->{rootdirsize} >> $parm->{secshift};
 
     # Offset to the data area in *sectors*
     $parm->{dataoffset} = ($startsec + $prefixsec) << $parm->{secshift};
@@ -659,14 +661,13 @@ sub assign_clust($) {
     if (!$f->{nclust}) {
 	$f->{clustno} = 0;
     } else {
-	$f->{clustno} = $parm->{endclust};
+	my $clustno = $f->{clustno} = $parm->{endclust};
 	$parm->{endclust} += $f->{nclust};
 	push(@{$root->{layout}}, $f);
 	if ($opt{verbose} >= 3) {
-	    my $clustoffs = $f->{clustno} ? $f->{clustno}-2 : -$root->{nclust};
 	    printf STDERR "%s: cluster %5d @ 0x%08x (len %5d) for \"%s\"\n",
-		$opt{outfile}, $f->{clustno},
-		$parm->{dataoffset} + ($clustoffs << $parm->{cbshift}),
+		$opt{outfile}, $clustno,
+		$parm->{dataoffset} + (($clustno-2) << $parm->{cbshift}),
 		$f->{nclust}, $f->{path} || '/';
 	}
     }
@@ -678,12 +679,22 @@ sub assign_clusters($) {
     my($root) = @_;
     my $parm = $root->{parm};
 
-    # This will contain the non-empty nodes in layout order
-    $root->{layout} = [];
+    $parm->{endclust} = 2;	# First real cluster
+    $root->{layout} = [];	# File nodes in layout order
 
-    $parm->{endclust} = $parm->{fattype} < 32 ? 0 : 2;
-    assign_clust($root);
-    $parm->{endclust} = 2 if ($parm->{fattype} < 32);
+    if ($parm->{rootdirsize}) {
+	# FAT12/16: root directory is special
+	$root->{clustno} = 0;
+	$root->{paddedsize} = $parm->{rootdirsize};
+	push(@{$root->{layout}}, $root);
+	if ($opt{verbose} >= 3) {
+	    printf STDERR "%s: root directory @ 0x%08x, %d sectors\n",
+		$opt{outfile}, $parm->{dataoffset} - $root->{paddedsize},
+		$root->{paddedsize} >> $parm->{secshift};
+	}
+    } else {
+	assign_clust($root);
+    }
     populate_with($root, $parm, $DIR,  \&assign_clust);
     populate_with($root, $parm, $FILE, \&assign_clust);
     die if ($parm->{endclust} > $parm->{clust} + 2);

@@ -500,6 +500,8 @@ sub get_format_params($$) {
     my($root, $cshift) = @_;
     my $csize = 1 << $cshift;
     my $cbytes = $csize << 9;
+    my $salign = $opt{align} ? $csize : 1;
+    my $balign = $salign << 9;
 
     my $c = count_clusters($root, $cshift);
     my $fattype;
@@ -541,25 +543,23 @@ sub get_format_params($$) {
 	return undef;
     }
 
-    # Size of each FAT in bytes
-    my $fatsize = (($c+2) * $fattype + 1) >> 3;
-
-    # Assume each FAT is padded to a cluster size.
-    $fatsize = align_up($fatsize, $cbytes) >> 9;
+    # Size of each FAT
+    my $fatsize = (($c+2) * $fattype + 1) >> 3;  # Bytes
+    $fatsize = align_up($fatsize, $balign) >> 9; # Sectors
     $sectors += $nfats*$fatsize;
 
     # Reserved sectors (in the FAT sense)
-    my $resv = max(($fattype < 32) ? 1 : 32, $csize);
+    my $resv = align_up(($fattype < 32) ? 1 : $opt{strict} ? 8 : 32, $salign);
     $sectors += $resv;
 
     # The root directory, if not FAT32
     if ($fattype < 32) {
-	$root->{size} += $resdir;
-	$sectors += align_up($root->{size}, $cbytes) >> 9;
+	$root->{size} = min($resdir + $root->{size}, 4095 << 9);
+	$sectors += align_up($root->{size}, $balign) >> 9;
     }
 
     # Dummy geometry
-    my $hs = [255, 63];
+    my $hs = [$opt{h} || 255, $opt{s} || 63];
 
     # Suitable MBR type
     my $mbrtype;
@@ -998,12 +998,15 @@ sub make_filesystem($) {
     my $csectors = $parm->{csectors};
 
     # Block alignment in sectors
-    my $align     = $csectors;
-    my $gptsize   = div_up($opt{gptent}, $parm->{sector} >> 7);
+    my $align     = $opt{align} ? $csectors : 1;
+    my $gptsize   = div_up(max($opt{gptent}, $opt{strict} ? 128 : 1),
+			   $parm->{sector} >> 7);
     my $startsec  = 0;
     my $endsec    = 0;
+    my $sectors   = $parm->{sectors};
     if ($opt{part} == $ANYPART) {
-	$opt{part} = $opt{efi} ? $GPT : $MBR;
+	$opt{part} = $opt{efi} || ($sectors + $align) > 0xffffffff
+	    ? $GPT : $MBR;
     } elsif (!$opt{part}) {
 	$opt{part} = $opt{efi} ? $GPT : $FLAT;
     }
@@ -1014,10 +1017,10 @@ sub make_filesystem($) {
 	$startsec = 1;
     }
     # Initial partition table + alignment + space for backup gpt if necessary
-    my $sectors   = $parm->{sectors} + $startsec + $endsec;
-    $sectors      = align_up($sectors, $align);
-    $endsec       = $sectors - $endsec;
-    my $fssec     = $endsec  - $startsec;
+    $startsec  = align_up($startsec, $align);
+    $sectors   = align_up($sectors + $startsec + $endsec, $align);
+    $endsec    = $sectors - $endsec;
+    my $fssec  = $endsec  - $startsec;
 
     # Update with the actually generated layout
     finalize_format_params($root, $startsec, $fssec);
@@ -1119,6 +1122,12 @@ sub get_arg_uints($$;$$) {
     die "$0: invalid argument to -$opt: $arg\n" if ($err);
     return @ns;
 }
+sub get_arg_uint($$;$) {
+    my($args, $opt, $truth) = @_;
+    return undef if (defined($truth) && !$truth);
+    my @ns = get_arg_uints($args,$opt,1);
+    return $ns[0];
+}
 
 sub do_options($@) {
     my $args = shift(@_);	# Argument list pointer
@@ -1140,7 +1149,7 @@ sub do_options($@) {
 	    } else {
 		$opt{part} = $FLAT unless ($opt{part} == $MBR);
 	    }
-	} elsif ($opt =~ /^(?:a|-active|-boot(able)?)$/) {
+	} elsif ($opt =~ /^(?:b|-active|-(?:legacy)?boot(?:able)?)$/) {
 	    $opt{active} = $truth;
 	} elsif ($opt =~ /^(?:m|-mbr)$/) {
 	    if ($truth) {
@@ -1166,8 +1175,16 @@ sub do_options($@) {
 	    $opt{verbose} = $truth ? $opt{verbose}+1 : 0;
 	} elsif ($opt =~ /^(?:q|-quiet)$/) {
 	    $opt{verbose} = $truth ? 0 : max($opt{verbose}, 1);
+	} elsif ($opt =~ /^(?:H|-heads)$/) {
+	    $opt{h} = get_arg_uint($args, $opt, $truth);
+	} elsif ($opt =~ /^(?:S|-secpertrack)$/) {
+	    $opt{s} = get_arg_uint($args, $opt, $truth);
 	} elsif ($opt =~ /^(?:L|n|-label|-name)$/) {
 	    $opt{volname} = $truth ? get_arg($args,$opt) : undef;
+	} elsif ($opt =~ /^(?:s|-strict)$/) {
+	    $opt{strict} = $truth;
+	} elsif ($opt =~ /^(?:a|-align)$/) {
+	    $opt{align} = $truth;
 	} elsif ($opt =~ /^(?:C|-creator)$/) {
 	    $opt{creator} = $truth ? get_arg($args,$opt) : undef;
 	} elsif ($opt =~ /^(?:W|-(win(.*)))$/) {

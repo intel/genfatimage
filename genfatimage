@@ -82,17 +82,40 @@ sub rand_bytes($) {
     }
 }
 
+# Decode optionally separated sequences of hexadecimal digits with
+# a list of maximum length (set to undef for any length)
+sub hexgroups($@) {
+    my($s, @grps) = @_;
+    my @l;
+    $s =~ s/\s+//g;
+    foreach my $g (@grps) {
+	last if ($s eq '');
+	$s =~ s/^([0-9a-f]{0,$g})[^0-9a-f\s]?//i;
+	push(@l, hex($1));
+    }
+    return @l;
+}
+
 # Yeah, the byte ordering here is weird as heck
-sub guid($$$$$) {
+sub guid(@) {
     my($a,$b,$c,$d,$e) = @_;
     return pack('VvvQ>', $a, $b, $c, ($d << 48) | $e);
 }
-
 sub rand_guid() {
     my @b = unpack('C*', rand_bytes(16));
     $b[7] = ($b[7] & 0x0f) | 0x40; # Version 4 (random)
     $b[8] = ($b[8] & 0x3f) | 0x80; # Variant 1
     return pack('C*', @b);
+}
+sub parse_guid($) {
+    my($s) = @_;
+    my @h = hexgroups($s,8,4,4,4,12);
+    return @h ? guid(@h) : rand_guid();
+}
+sub guid_str($) {
+    my($guid) = @_;
+    my @w = unpack('VvvnnN', $guid."\0\0");
+    return sprintf('%08X-%04X-%04X-%04X-%04X%08X', @w);
 }
 
 sub to_chs($;$) {
@@ -106,9 +129,9 @@ sub to_chs($;$) {
     return pack('C3', $h, ($c >> 2)|$s, $c & 0xff);
 }
 # Create a minimal MBR partition table with one single partition.
-sub gen_mbr($$$;$$)
+sub gen_mbr($$$;$$$)
 {
-    my($part_start, $part_len, $part_type, $hs, $active) = @_;
+    my($part_start, $part_len, $part_type, $hs, $active, $id) = @_;
     my $part_end = min($part_start+$part_len-1, 0xffffffff);
     my $pe;
     if ($part_start <= 0xffffffff) {
@@ -116,26 +139,26 @@ sub gen_mbr($$$;$$)
 		   $active ? 0x80 : 0, to_chs($part_start, $hs),
 		   $part_type, to_chs($part_end, $hs), $part_start, $part_len);
     }
-    return pack('a440a4va64v', $KILLBOOT, rand_bytes(4), 0, $pe, 0xaa55);
+    return pack('a440a4va64v', $KILLBOOT, $id, 0, $pe, 0xaa55);
 }
 
 # Create a minimal GPT partition table with one single partition.
 # Return a vector containing the PMBR, the GPT header,
 # the GPT array, and the backup GPT header in that order.
 # $gpt_len is the desired size of the GPT array in sectors.
-sub gen_gpt($$$$$;$$) {
+sub gen_gpt($$$$$;$$$$) {
     my($disk_len, $part_start, $part_len, $part_type,
-       $gpt_len, $part_name, $hs) = @_;
+       $gpt_len, $part_name, $disk_guid, $part_guid, $hs) = @_;
     my @blks;
 
-    # PMBR
+    # PMBR - per spec the PMBR has no disk ID
     $blks[0] = gen_mbr(1, $disk_len-1, 0xee, $hs);
 
     # GPT partition array
-    $blks[2] = $part_type . rand_guid() .
-	pack('Q<Q<Q<a142v', $part_start, $part_start + $part_len - 1,
-	     ($opt{efi} ? 1 : 0) | ($opt{active} ? 4 : 0),
-	     to_uni($part_name), 0);
+    $blks[2] = pack('a16a16Q<Q<Q<a142v', $part_type, $part_guid,
+		    $part_start, $part_start + $part_len - 1,
+		    ($opt{efi} ? 1 : 0) | ($opt{active} ? 4 : 0),
+		    to_uni($part_name), 0);
     $blks[2] .= "\0" x (($gpt_len << 9) - length($blks[2]));
     my $array_crc = crc32($blks[2]);
 
@@ -189,10 +212,7 @@ sub pathlist($;$) {
 	}
     }
 
-    if (!scalar(@path)) {
-	die "$0: empty path?: \"$path\"";
-    }
-
+    die "$0: empty path?: \"$path\"" if (!@path);
     return @path;
 }
 
@@ -218,11 +238,22 @@ sub normalize_filename($) {
     return $vn;
 }
 
-sub set_node_type($$) {
-    my($node, $type) = @_;
-    die if ($node->{type});
-    $node->{type} = $type;
-    push(@{$node->{root}->{nodes}->{$type}}, $node);
+sub set_node_type($$;$) {
+    my($node, $type, $inpath) = @_;
+    if ($node->{type}) {
+	if ($node->{type} != $type) {
+	    printf STDERR "%s: type conflict: %s (%s and %s)\n",
+		$opt{outfile}, $node->{type} eq $DIR ? ' and directory' : '',
+		$node->{path}, $node->{inpath}, $inpath;
+	    return 0;
+	}
+    } else {
+	$node->{type} = $type;
+	push(@{$node->{root}->{nodes}->{$type}}, $node);
+	$node->{files} = {} if ($type == $DIR);
+    }
+    $node->{inpath} = $inpath;
+    return 1;
 }
 
 # Creates or finds a node in the directory tree from a list of names
@@ -233,11 +264,8 @@ sub mktreenode($@) {
     foreach my $p (@path) {
 	my $herepath = $here->{path};
 
-	if (!$here->{type}) {
-	    set_node_type($here, $DIR);
-	    $here->{files} = {};
-	} elsif ($here->{type} != $DIR) {
-	    print STDERR "$opt{outfile}: file and directory conflict: $herepath\n";
+	if (!set_node_type($here, $DIR)) {
+	    print STDERR "$opt{outfile}: type conflict: $herepath\n";
 	    $err++;
 	    return undef;
 	}
@@ -270,7 +298,7 @@ sub inputnode($$) {
     }
 
     my @st = stat($inpath);
-    if (!scalar(@st)) {
+    if (!@st) {
 	print STDERR "$inpath: path not found\n";
 	$err++;
 	return;
@@ -293,7 +321,7 @@ sub inputnode($$) {
 # Create the root directory node
 sub rootdir() {
     my $root = {
-	'path' => undef, 'name' => undef, 'date' => time(), 'files' => {},
+	'path' => undef, 'name' => undef, 'files' => {},
 	'type' => $DIR
     };
     $root->{root} = $root;
@@ -312,6 +340,15 @@ sub cat_path($$) {
     return File::Spec->catpath(@sp);
 }
 
+sub node_date($) {
+    my($node) = @_;
+
+    do {
+	return $node->{date} if (defined($node->{date}));
+    } while ($node = $node->{up});
+    return 0;
+}
+
 # Add an input file or directory to a directory node
 sub add_input($;$) {
     my($dest, $inpath) = @_;
@@ -320,23 +357,14 @@ sub add_input($;$) {
     $inpath = $dest->{inpath} unless (defined($inpath));
 
     my @st = stat($inpath);
-
-    if (!scalar(@st)) {
+    if (!@st) {
 	print STDERR "$opt{outfile}: input not found: $inpath\n";
 	return;
     }
     my $mode = $st[2];
 
-    $dest->{date}  = $st[9] if ($st[9] > $dest->{date});
-
     if (S_ISDIR($mode)) {
-	if (!$dest->{type}) {
-	    $dest->{files} = {};
-	    $dest->{inpath} = $inpath;
-	    set_node_type($dest, $DIR);
-	} elsif ($dest->{type} != $DIR) {
-	    printf STDERR "%s: file and directory conflict: %s (%s and %s)\n",
-		$opt{outfile}, $dest->{path}, $dest->{inpath}, $inpath;
+	if (!set_node_type($dest, $DIR, $inpath)) {
 	    $err++;
 	    return;
 	}
@@ -354,22 +382,19 @@ sub add_input($;$) {
 	}
 	closedir($dh);
     } elsif (S_ISREG($mode)) {
-	if ($dest->{type}) {
-	    printf STDERR "%s: file%s conflict: %s (%s and %s)\n",
-		$opt{outfile}, $dest->{type} eq $DIR ? ' and directory' : '',
-		$dest->{path}, $dest->{inpath}, $inpath;
+	if (!set_node_type($dest, $FILE, $inpath)) {
 	    $err++;
 	    return;
 	}
-	set_node_type($dest, $FILE);
-	$dest->{size}   = $st[7];
-	$dest->{inpath} = $inpath;
-	$dest->{flags}  = !($mode & S_IWRITE); # Readonly bit
+	$dest->{size}  = $st[7];
+	$dest->{flags} = !($mode & S_IWRITE); # Readonly bit
     } else {
 	printf STDERR "$opt{outfile}: skipping non-regular file: $inpath\n";
 	$err++;
 	return;
     }
+    # Successful!
+    $dest->{date} = max(node_date($dest), $st[9]);
 }
 
 #
@@ -783,19 +808,6 @@ sub dosdate($) {
 	($lt[2] << 11) + ($lt[1] << 5) + ($lt[0] >> 1);
 }
 
-sub node_date($) {
-    my($node) = @_;
-
-    do {
-	if (defined($node->{date})) {
-	    return $node->{date};
-	}
-	$node = $node->{up};
-    } while (defined($node));
-
-    return 0;
-}
-
 sub dir_shortent($$$$$) {
     my($name, $attr, $date, $clustno, $size) = @_;
 
@@ -916,6 +928,9 @@ sub emit_superblock($$) {
     my $sec32 = $parm->{sectors};
     my $sec16 = ($fat < 32 && $sec32 <= 0xffff) ? $sec32 : 0;
 
+    $opt{winnt} = $opt{strict} unless (defined($opt{winnt}));
+    $opt{creator} = 'WINNT4.1' if ($opt{winnt});
+
     my $bs = pack('CvA8vCvCvvCvvvVV',
 		  0xe9, 0x1fe-length($KILLBOOT)-3, $opt{creator},
 		  $parm->{sector},
@@ -932,7 +947,7 @@ sub emit_superblock($$) {
 		    $root->{clustno}, 1, $backupsb, '');
     }
 
-    $bs .= pack('CCCVA11A8', 0x80, 0, 0x29, $root->{volid},
+    $bs .= pack('CCCa4A11A8', 0x80, 0, 0x29, $root->{volid},
 		$root->{vollbl}->{shortname}, "FAT$fat");
 
     $bs .= ("\0" x (0x1fe - length($KILLBOOT) - length($bs)));
@@ -959,16 +974,28 @@ sub emit_superblock($$) {
 sub create_vol_label($) {
     my($root) = @_;
 
-    my $volid = $root->{volid} = unpack('V', rand_bytes(4));
+    $root->{diskid} = parse_guid($opt{diskid});
+    $root->{partid} = parse_guid($opt{partid});
+
+    my @vo = hexgroups($opt{volid},2,2);
+    $root->{volid} = @vo ? pack('vv',$vo[1],$vo[0]) : rand_bytes(4);
 
     my $vol = $opt{volname};
-    if (!defined($vol)) {
-	$vol = $opt{efi} ? 'EFI BOOT' :
-	    sprintf('%04X-%04X', $volid >> 16, $volid & 0xffff);
+    $vol = 'EFI BOOT' if (!defined($vol) && $opt{efi});
+    $vol = decode_utf8($vol);
+    $root->{vollbl} = {	'name' => $vol, 'up' => $root, 'root' => $root };
+    if ($vol ne '') {
+	set_node_type($root->{files}->{' :vol'} = $root->{vollbl}, $VOL);
     }
-    $root->{vollbl} = {	'name' => decode_utf8($vol), 'up' => $root };
-    set_node_type($root->{files}->{' :vol'} = $root->{vollbl}, $VOL)
-	unless ($vol eq '');
+
+    if ($opt{verbose} >= 1) {
+	@vo = unpack('vv',$root->{volid});
+	print STDERR "$opt{outfile}: diskid ", guid_str($root->{diskid}) ,"\n";
+	print STDERR "$opt{outfile}: partid ", guid_str($root->{partid}), "\n";
+	printf STDERR "%s: volid  %04X-%04X\n", $opt{outfile}, $vo[1], $vo[0];
+	printf STDERR "%s: label  %s\n", $opt{outfile},
+	    $vol eq '' ? 'none' : "\"$vol\"";
+    }
 }
 
 sub make_filesystem($) {
@@ -1056,10 +1083,11 @@ sub make_filesystem($) {
     my @part; # MBR, GPT header, GPT array, backup GPT header
     if ($opt{part} == $GPT) {
 	@part = gen_gpt($sectors, $startsec, $fssec, $parm->{gpttype},
-			$gptsize, $root->{vollbl}->{name}, $parm->{hs});
+			$gptsize, $root->{vollbl}->{name},
+			$root->{diskid}, $root->{partid}, $parm->{hs});
     } elsif ($opt{part} == $MBR) {
 	$part[0] = gen_mbr($startsec, $fssec, $parm->{mbrtype},
-			   $parm->{hs}, $parm->{active});
+			   $parm->{hs}, $parm->{active}, $root->{diskid});
     }
 
     my $bytes = emit($out, @part[0 ... 2]);
@@ -1088,112 +1116,112 @@ sub make_filesystem($) {
 }
 
 sub get_arg($$;$) {
-    my($args,$opt,$optional) = @_;
+    my($args,$os,$truth) = @_;
 
-    if ($opt =~ /^-.*?=(.*)$/) {
-	return $1;
-    }
-    return undef if ($optional);
+    $truth = 1 unless (defined($truth));
+    return undef if (!$truth);
+    return $1 if ($os =~ /^-.*?=(.*)$/);	# = separated argument
+    return undef if ($truth < 0);		# Missing optional argument
     my $arg = shift(@$args);
     if (!defined($arg)) {
-	die "$0: option -$opt requires an argument\n";
+	die "$0: option -$os requires an argument\n";
     }
     return $arg;
 }
 sub get_arg_uints($$;$$) {
-    my($args,$opt,$cmin,$cmax) = @_;
-    $cmin = 1 unless (defined($cmin));
-    $cmax = $cmin unless ($cmax > $cmin);
+    my($args,$os,$truth,$cmax) = @_;
 
-    my $arg = get_arg($args, $opt, $cmin < 1);
-    return () unless (defined($arg));
+    my $arg = get_arg($args, $os, $truth);
+    return () unless ($arg ne '');
 
-    my $err;
     my @ns;
     foreach my $a (split(/,/, $arg)) {
 	if ($a =~ /^\s*(0x[0-9a-f]|[0-9]+)\s*([kmgtpe])?\s*$/i) {
 	    my $suf = lc($2);
 	    my $n = $1;
-	    $n = ($n =~ /^0x/i) ? hex($n) : $n+0;
-	    $n <<= 10 * index(' kmgtpe', $suf);
-	    push(@ns, $n);
+	    $n = hex($n) if ($n =~ /^0x/i);
+	    push(@ns, $n << (10 * index(' kmgtpe', $suf)));
 	} else {
-	    $err++;
+	    undef @ns;
+	    last;
 	}
     }
-    $err++ if (scalar(@ns) < $cmin || scalar(@ns) > $cmax);
-    die "$0: invalid argument to -$opt: $arg\n" if ($err);
-    return @ns;
+    if (!@ns || scalar(@ns) > max($cmax,1)) {
+	die "$0: invalid argument to -$os: $arg\n";
+    }
+    return \@ns;
 }
 sub get_arg_uint($$;$) {
-    my($args, $opt, $truth) = @_;
-    return undef if (defined($truth) && !$truth);
-    my @ns = get_arg_uints($args,$opt,1);
-    return $ns[0];
+    my $ns = get_arg_uints(@_);
+    return $ns ? $ns->[0] : undef;
 }
 
 sub do_options($@) {
     my $args = shift(@_);	# Argument list pointer
 
-    foreach my $opt (@_) {
+    foreach my $os (@_) {
 	my $truth = 1;
-	$truth = 0 if ($opt =~ s/^-no-/-/);
+	$truth = 0 if ($os =~ s/^-no-/-/);
 
-	if ($opt =~ /^(?:o|-output)$/) {
-	    $opt{output} = $truth ?
-		get_arg($args, $opt) : File::Spec->devnull();
-	} elsif ($opt =~ /^(?:e|-efi|-uefi)$/) {
+	if ($os =~ /^(?:o|-output)$/) {
+	    $opt{output} = $truth ? get_arg($args, $os) : File::Spec->devnull();
+	} elsif ($os =~ /^(?:e|-efi|-uefi)$/) {
 	    $opt{efi} = $truth;
-	} elsif ($opt =~ /^(?:g|-gpt)$/) {
+	} elsif ($os =~ /^(?:g|-gpt)$/) {
 	    if ($truth) {
 		$opt{part} = $GPT;
-		my @ent = get_arg_uints($args, $opt, 0);
-		$opt{gptent} = $ent[0] if ($ent[0]);
+		$opt{gptent} = get_arg_uint($args,$os,-1);
 	    } else {
 		$opt{part} = $FLAT unless ($opt{part} == $MBR);
 	    }
-	} elsif ($opt =~ /^(?:b|-active|-(?:legacy-?)?boot(?:able)?)$/) {
+	} elsif ($os =~ /^(?:b|-active|-(?:legacy-?)?boot(?:able)?)$/) {
 	    $opt{active} = $truth;
-	} elsif ($opt =~ /^(?:m|-mbr)$/) {
+	} elsif ($os =~ /^(?:m|-mbr)$/) {
 	    if ($truth) {
 		$opt{part} = $MBR;
 	    } else {
 		$opt{part} = $FLAT unless ($opt{part} == $GPT);
 	    }
-	} elsif ($opt =~ /^(?:f|-flat)$/) {
+	} elsif ($os =~ /^(?:f|-flat)$/) {
 	    if ($truth) {
 		$opt{part} = $FLAT;
 	    } else {
 		$opt{part} = $ANYPART if ($opt{part} == $FLAT);
 	    }
-	} elsif ($opt =~ /^(?:p|-part)$/) {
+	} elsif ($os =~ /^(?:p|-part)$/) {
 	    if ($truth) {
 		$opt{part} = $ANYPART unless ($opt{part} > $ANYPART);
 	    } else {
 		$opt{part} = $FLAT;
 	    }
-	} elsif ($opt =~ /^(?:r|-reserve)$/) {
-	    $opt{reserve} = $truth ? [get_arg_uints($args,$opt,1,2)] : undef;
-	} elsif ($opt =~ /^(?:v|-verbose)$/) {
+	} elsif ($os =~ /^(?:r|-reserve)$/) {
+	    $opt{reserve} = get_arg_uints($args,$os,$truth,2);
+	} elsif ($os =~ /^(?:v|-verbose)$/) {
 	    $opt{verbose} = $truth ? $opt{verbose}+1 : 0;
-	} elsif ($opt =~ /^(?:q|-quiet)$/) {
+	} elsif ($os =~ /^(?:q|-quiet)$/) {
 	    $opt{verbose} = $truth ? 0 : max($opt{verbose}, 1);
-	} elsif ($opt =~ /^(?:H|-heads)$/) {
-	    $opt{h} = get_arg_uint($args, $opt, $truth);
-	} elsif ($opt =~ /^(?:S|-secpertrack)$/) {
-	    $opt{s} = get_arg_uint($args, $opt, $truth);
-	} elsif ($opt =~ /^(?:L|n|-label|-name|-volume(?:-?name)?)$/) {
-	    $opt{volname} = $truth ? get_arg($args,$opt) : '';
-	} elsif ($opt =~ /^(?:s|-strict)$/) {
+	} elsif ($os =~ /^(?:H|-heads)$/) {
+	    $opt{h} = get_arg_uint($args, $os,$truth);
+	} elsif ($os =~ /^(?:S|-secpertrack)$/) {
+	    $opt{s} = get_arg_uint($args, $os,$truth);
+	} elsif ($os =~ /^(?:L|n|-label|-name|-volume(?:-?name)?)$/) {
+	    $opt{volname} = get_arg($args,$os,$truth) . '';
+	} elsif ($os =~ /^(?:s|-strict)$/) {
 	    $opt{strict} = $truth;
-	} elsif ($opt =~ /^(?:a|-align)$/) {
+	} elsif ($os =~ /^(?:a|-align)$/) {
 	    $opt{align} = $truth;
-	} elsif ($opt =~ /^(?:C|-creator)$/) {
-	    $opt{creator} = $truth ? get_arg($args,$opt) : undef;
-	} elsif ($opt =~ /^(?:W|-(win(.*)))$/) {
-	    $opt{creator} = $2 ne '' ? uc($1) : 'WINNT4.1' if ($truth);
+	} elsif ($os eq '-diskid') {
+	    $opt{diskid} = get_arg($args,$os,$truth);
+	} elsif ($os eq '-partid') {
+	    $opt{partid} = get_arg($args,$os,$truth);
+	} elsif ($os eq '-volid') {
+	    $opt{volid} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^(?:C|-creator)$/) {
+	    $opt{creator} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^(?:W|-win(?:nt)?$/) {
+	    $opt{winnt} = $truth;
 	} else {
-	    die "$0: unknown option: -$opt\n";
+	    die "$0: unknown option: -$os\n";
 	}
     }
 }
@@ -1225,7 +1253,7 @@ sub parse_options(@_) {
 }
 
 my(@inputs) = parse_options(@ARGV);
-if (!scalar(@inputs)) {
+if (!@inputs) {
     die <<EOF;
 Usage: $0 [options] outfile input_path[::[destination]] ...
        Inputs can be files or directories.

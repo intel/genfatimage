@@ -908,7 +908,6 @@ sub emit_file {
 }
 
 # Generate the FAT superblock
-my $whoami = 'mkefiimg';
 sub emit_superblock($$) {
     my($root, $parm) = @_;
     my $fat = $parm->{fattype};
@@ -917,7 +916,8 @@ sub emit_superblock($$) {
     my $sec16 = ($fat < 32 && $sec32 <= 0xffff) ? $sec32 : 0;
 
     my $bs = pack('CvA8vCvCvvCvvvVV',
-		  0xe9, 0x1fe-length($KILLBOOT)-3, $whoami, $parm->{sector},
+		  0xe9, 0x1fe-length($KILLBOOT)-3, $opt{creator},
+		  $parm->{sector},
 		  $parm->{csectors}, $parm->{resv}, $parm->{nfats},
 		  $root->{clustno} ? 0 : $root->{paddedsize} >> 5,
 		  $sec16, $parm->{media},
@@ -954,23 +954,23 @@ sub emit_superblock($$) {
     return $bytes;
 }
 
-# Create long and short volume labels
-sub create_vol_label($$) {
-    my($root, $vol) = @_;
+# Create long and short volume labels.
+sub create_vol_label($) {
+    my($root) = @_;
 
     $root->{volid} = unpack('V', rand_bytes(4));
-    $root->{vollbl} = {
-	'name' => decode_utf8($vol), 'type' => $VOL, 'up' => $root
-    };
-    if ($vol ne '') {
-	$root->{files}->{':vol'} = $root->{vollbl};
-    }
+
+    my $vol = $opt{volname};
+    $vol = 'EFI BOOT' if (!defined($vol) && $opt{efi});
+    $root->{vollbl} = {	'name' => decode_utf8($vol), 'up' => $root };
+    set_node_type($root->{files}->{' :vol'} = $root->{vollbl}, $VOL)
+	unless ($vol eq '');
 }
 
 sub make_filesystem($) {
     my($root) = @_;
 
-    create_vol_label($root, $opt{volname});
+    create_vol_label($root);
     prep_directories($root);
 
     # Compute a suitable cluster shift.
@@ -1167,6 +1167,10 @@ sub do_options($@) {
 	    $opt{verbose} = $truth ? 0 : max($opt{verbose}, 1);
 	} elsif ($opt =~ /^(?:L|n|-label|-name)$/) {
 	    $opt{volname} = $truth ? get_arg($args,$opt) : undef;
+	} elsif ($opt =~ /^(?:C|-creator)$/) {
+	    $opt{creator} = $truth ? get_arg($args,$opt) : undef;
+	} elsif ($opt =~ /^(?:W|-(win(.*)))$/) {
+	    $opt{creator} = $2 ne '' ? uc($1) : 'WINNT4.1' if ($truth);
 	} else {
 	    die "$0: unknown option: -$opt\n";
 	}
@@ -1179,7 +1183,8 @@ sub parse_options(@_) {
 
     # Defaults and environment variable overrides
     $opt{verbose} = $ENV{'V'};
-    $opt{volname} = $ENV{'VOLNAME'} || 'EFI BOOT';
+    $opt{volname} = $ENV{'VOLNAME'};
+    $opt{creator} = 'FatImage';
     $opt{namelen} = 64;		# Assumed maximum length per reserved file
     $opt{gptent}  = 1;		# Minimum number of GPT entries
 

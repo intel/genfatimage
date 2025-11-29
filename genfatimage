@@ -959,10 +959,13 @@ sub emit_superblock($$) {
 sub create_vol_label($) {
     my($root) = @_;
 
-    $root->{volid} = unpack('V', rand_bytes(4));
+    my $volid = $root->{volid} = unpack('V', rand_bytes(4));
 
     my $vol = $opt{volname};
-    $vol = 'EFI BOOT' if (!defined($vol) && $opt{efi});
+    if (!defined($vol)) {
+	$vol = $opt{efi} ? 'EFI BOOT' :
+	    sprintf('%04X-%04X', $volid >> 16, $volid & 0xffff);
+    }
     $root->{vollbl} = {	'name' => decode_utf8($vol), 'up' => $root };
     set_node_type($root->{files}->{' :vol'} = $root->{vollbl}, $VOL)
 	unless ($vol eq '');
@@ -1179,8 +1182,8 @@ sub do_options($@) {
 	    $opt{h} = get_arg_uint($args, $opt, $truth);
 	} elsif ($opt =~ /^(?:S|-secpertrack)$/) {
 	    $opt{s} = get_arg_uint($args, $opt, $truth);
-	} elsif ($opt =~ /^(?:L|n|-label|-name)$/) {
-	    $opt{volname} = $truth ? get_arg($args,$opt) : undef;
+	} elsif ($opt =~ /^(?:L|n|-label|-name|-volume(?:-?name)?)$/) {
+	    $opt{volname} = $truth ? get_arg($args,$opt) : '';
 	} elsif ($opt =~ /^(?:s|-strict)$/) {
 	    $opt{strict} = $truth;
 	} elsif ($opt =~ /^(?:a|-align)$/) {

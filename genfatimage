@@ -69,6 +69,7 @@ sub div_up($$) {
 
 # Code to kill a BIOS boot: 1: int $0x80; hlt; jmp 1b
 my $KILLBOOT = "\xcd\x18\xf4\xeb\xfb";
+my $KILLOFFS = 0x180;		# Must be valid for MBR and FAT bootsector
 
 # Create a random (type 4) GUID
 # For Crypt::Random::Source < 0.13 using get_strong() would be better
@@ -139,7 +140,8 @@ sub gen_mbr($$$;$$$)
 		   $active ? 0x80 : 0, to_chs($part_start, $hs),
 		   $part_type, to_chs($part_end, $hs), $part_start, $part_len);
     }
-    return pack('a440a4va64v', $KILLBOOT, $id, 0, $pe, 0xaa55);
+    return pack('Cv.a*@440a4va64v', 0xe9, $KILLOFFS-3, $KILLOFFS,
+		$KILLBOOT, $id, 0, $pe, 0xaa55);
 }
 
 # Create a minimal GPT partition table with one single partition.
@@ -155,11 +157,11 @@ sub gen_gpt($$$$$;$$$$) {
     $blks[0] = gen_mbr(1, $disk_len-1, 0xee, $hs);
 
     # GPT partition array
-    $blks[2] = pack('a16a16Q<Q<Q<a142v', $part_type, $part_guid,
+    $blks[2] = pack('a16a16Q<Q<Q<a142v.', $part_type, $part_guid,
 		    $part_start, $part_start + $part_len - 1,
 		    ($opt{efi} ? 1 : 0) | ($opt{active} ? 4 : 0),
-		    to_uni($part_name), 0);
-    $blks[2] .= "\0" x (($gpt_len << 9) - length($blks[2]));
+		    to_uni($part_name), 0,
+		    $gpt_len << 9);
     my $array_crc = crc32($blks[2]);
 
     # GPT headers (primary and alternate)
@@ -167,11 +169,10 @@ sub gen_gpt($$$$$;$$$$) {
     foreach my $hdr ([1, 1, $disk_len-1, 2],
 		     [3, $disk_len-1, 1, $disk_len-$gpt_len-1]) {
 	my($i, $here, $there, $array) = @$hdr;
-	$blks[$i] = 'EFI PART'.
-	    pack('VVVVQ<Q<Q<Q<', 0x10000, 92, 0, 0,
-		 $here, $there, $gpt_len+2,  $disk_len-$gpt_len-2) .
-	    $disk_guid .
-	    pack('Q<VVV', $array, $gpt_len << 2, 128, $array_crc);
+	$blks[$i] =
+	    pack('a8VVVVQ<Q<Q<Q<a16Q<VVV', 'EFI PART', 0x10000, 92, 0, 0,
+		 $here, $there, $gpt_len+2,  $disk_len-$gpt_len-2,
+		 $disk_guid, $array, $gpt_len << 2, 128, $array_crc);
 
 	my $hdr_crc = crc32($blks[$i]);
 	substr($blks[$i], 16, 4) = pack('V', $hdr_crc);
@@ -416,10 +417,7 @@ sub genlongname($) {
     my $u = substr(to_uni($s), 0, 255 << 1);
     my $p = (length($u) >> 1) % 13;
 
-    if ($p) {
-	$u .= "\0\0";
-	$u .= "\xff\xff" x (12-$p);
-    }
+    $u .= "\0\0" . ("\xff\xff" x (12-$p)) if ($p);
     return $u;
 }
 
@@ -931,7 +929,7 @@ sub emit_superblock($$) {
     $opt{creator} = 'WINNT4.1' if ($opt{winnt});
 
     my $bs = pack('CvA8vCvCvvCvvvVV',
-		  0xe9, 0x1f0-length($KILLBOOT)-3, $opt{creator},
+		  0xe9, $KILLOFFS-3, $opt{creator},
 		  $parm->{sector},
 		  $parm->{csectors}, $parm->{resv}, $parm->{nfats},
 		  $root->{clustno} ? 0 : $root->{paddedsize} >> 5,
@@ -946,11 +944,10 @@ sub emit_superblock($$) {
 		    $root->{clustno}, 1, $backupsb, '');
     }
 
-    $bs .= pack('CCCa4A11A8', 0x80, 0, 0x29, $root->{volid},
-		$root->{vollbl}->{shortname}, "FAT$fat");
-
-    $bs .= ("\0" x (0x1f0 - length($KILLBOOT) - length($bs)));
-    $bs .= $KILLBOOT . pack('a14v', '', 0xaa55);
+    $bs .= pack('CCCa4A11A8.a*.v', 0x80, 0, 0x29, $root->{volid},
+		$root->{vollbl}->{shortname}, "FAT$fat",
+		$KILLOFFS - length($bs), $KILLBOOT,
+		510 - length($bs), 0xaa55);
 
     my $out = $parm->{out};
     my $bytes = emit($out, $bs);

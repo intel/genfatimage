@@ -320,12 +320,10 @@ sub inputnode($$) {
 
 # Create the root directory node
 sub rootdir() {
-    my $root = {
-	'path' => undef, 'name' => undef, 'files' => {},
-	'type' => $DIR
-    };
+    my $root = {'path' => undef, 'name' => undef};
     $root->{root} = $root;
-    $root->{nodes} = { $FILE => [], $VOL => [], $DIR => [$root] };
+    $root->{nodes} = { $FILE => [], $VOL => [], $DIR => [] };
+    set_node_type($root, $DIR);
     return $root;
 }
 
@@ -725,7 +723,8 @@ sub emit_fat32($$$) {
 }
 
 sub emit_one_fat($) {
-    my($parm) = @_;
+    my($root) = @_;
+    my $parm = $root->{parm};
     my $out = $parm->{out};
     my %emit_func = (
 	12 => \&emit_fat12,
@@ -741,7 +740,7 @@ sub emit_one_fat($) {
     $bytes += $emit->($out, -1, \$hold);
 
     my $clustno = 2;
-    foreach my $f (@{$parm->{layout}}) {
+    foreach my $f (@{$root->{layout}}) {
 	next if (!$f->{clustno});		# No cluster chain
 	die if ($f->{clustno} != $clustno);	# This would be bad...
 	my $nclust = $f->{nclust};
@@ -932,7 +931,7 @@ sub emit_superblock($$) {
     $opt{creator} = 'WINNT4.1' if ($opt{winnt});
 
     my $bs = pack('CvA8vCvCvvCvvvVV',
-		  0xe9, 0x1fe-length($KILLBOOT)-3, $opt{creator},
+		  0xe9, 0x1f0-length($KILLBOOT)-3, $opt{creator},
 		  $parm->{sector},
 		  $parm->{csectors}, $parm->{resv}, $parm->{nfats},
 		  $root->{clustno} ? 0 : $root->{paddedsize} >> 5,
@@ -950,8 +949,8 @@ sub emit_superblock($$) {
     $bs .= pack('CCCa4A11A8', 0x80, 0, 0x29, $root->{volid},
 		$root->{vollbl}->{shortname}, "FAT$fat");
 
-    $bs .= ("\0" x (0x1fe - length($KILLBOOT) - length($bs)));
-    $bs .= $KILLBOOT . pack('v', 0xaa55);
+    $bs .= ("\0" x (0x1f0 - length($KILLBOOT) - length($bs)));
+    $bs .= $KILLBOOT . pack('a14v', '', 0xaa55);
 
     my $out = $parm->{out};
     my $bytes = emit($out, $bs);
@@ -977,22 +976,24 @@ sub create_vol_label($) {
     $root->{diskid} = parse_guid($opt{diskid});
     $root->{partid} = parse_guid($opt{partid});
 
-    my @vo = hexgroups($opt{volid},2,2);
+    my @vo = hexgroups($opt{volid},4,4);
     $root->{volid} = @vo ? pack('vv',$vo[1],$vo[0]) : rand_bytes(4);
 
     my $vol = $opt{volname};
-    $vol = 'EFI BOOT' if (!defined($vol) && $opt{efi});
+    $vol = 'EFI BOOT' if ($vol eq '' && $opt{efi});
     $vol = decode_utf8($vol);
-    $root->{vollbl} = {	'name' => $vol, 'up' => $root, 'root' => $root };
+    # The shortname is only used in the boot sector when no actual label
+    $root->{vollbl} = {	'name' => $vol, 'up' => $root,
+			'root' => $root, 'shortname' => 'NO NAME' };
     if ($vol ne '') {
 	set_node_type($root->{files}->{' :vol'} = $root->{vollbl}, $VOL);
     }
 
     if ($opt{verbose} >= 1) {
-	@vo = unpack('vv',$root->{volid});
+	my $vostr = sprintf('%04X-%04X',reverse unpack('v*', $root->{volid}));
 	print STDERR "$opt{outfile}: diskid ", guid_str($root->{diskid}) ,"\n";
 	print STDERR "$opt{outfile}: partid ", guid_str($root->{partid}), "\n";
-	printf STDERR "%s: volid  %04X-%04X\n", $opt{outfile}, $vo[1], $vo[0];
+	printf STDERR "%s: volid  %s\n", $opt{outfile}, $vostr;
 	printf STDERR "%s: label  %s\n", $opt{outfile},
 	    $vol eq '' ? 'none' : "\"$vol\"";
     }
@@ -1099,7 +1100,7 @@ sub make_filesystem($) {
 
     # The FATs
     for (my $i = 0; $i < $parm->{nfats}; $i++) {
-	$bytes += emit_one_fat($parm);
+	$bytes += emit_one_fat($root);
     }
 
     # Root directory, subdirectories, files
@@ -1152,7 +1153,8 @@ sub get_arg_uints($$;$$) {
     return \@ns;
 }
 sub get_arg_uint($$;$) {
-    my $ns = get_arg_uints(@_);
+    my($args,$os,$truth) = @_;
+    my $ns = get_arg_uints($args, $os, $truth);
     return $ns ? $ns->[0] : undef;
 }
 
@@ -1218,7 +1220,7 @@ sub do_options($@) {
 	    $opt{volid} = get_arg($args,$os,$truth);
 	} elsif ($os =~ /^(?:C|-creator)$/) {
 	    $opt{creator} = get_arg($args,$os,$truth);
-	} elsif ($os =~ /^(?:W|-win(?:nt)?$/) {
+	} elsif ($os =~ /^(?:W|-win(?:nt)?)$/) {
 	    $opt{winnt} = $truth;
 	} else {
 	    die "$0: unknown option: -$os\n";

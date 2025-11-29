@@ -133,7 +133,8 @@ sub gen_gpt($$$$$;$$) {
 
     # GPT partition array
     $blks[2] = $part_type . rand_guid() .
-	pack('Q<Q<Q<a142v', $part_start, $part_start + $part_len - 1, 1,
+	pack('Q<Q<Q<a142v', $part_start, $part_start + $part_len - 1,
+	     ($opt{efi} ? 1 : 0) | ($opt{active} ? 4 : 0),
 	     to_uni($part_name), 0);
     $blks[2] .= "\0" x (($gpt_len << 9) - length($blks[2]));
     my $array_crc = crc32($blks[2]);

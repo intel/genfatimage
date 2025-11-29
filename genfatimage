@@ -526,7 +526,7 @@ sub get_format_params($$) {
 
     my $c = count_clusters($root, $cshift);
     my $fattype;
-    my $nfats = 2;
+    my $nfats = $opt{strict} ? 2 : 1;
 
     # Reserved space; if the "extra files" part is set make sure there is at
     # least one free cluster per file, and enough space to put any

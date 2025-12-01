@@ -665,6 +665,10 @@ sub assign_clust($) {
     my $root = $f->{root};
     my $parm = $root->{parm};
 
+    if (!defined($f->{size}) && defined($f->{data})) {
+	$f->{size} = length($f->{data});
+    }
+
     $f->{paddedsize} = align_up($f->{size}, $parm->{cbytes});
     $f->{nclust} = $f->{paddedsize} >> $parm->{cbshift};
     if (!$f->{nclust}) {
@@ -790,7 +794,6 @@ sub emit($@) {
 	$bytes += length($s);
 	print $fh $s;
     }
-
     return $bytes;
 }
 
@@ -798,12 +801,13 @@ sub emitzero($$) {
     my($fh, $bytes) = @_;
     my $left = $bytes;
 
+    return 0 if ($left <= 0);
+
     while ($left) {
 	my $chunk = min($left, $BUFSIZ);
 	print $fh ("\0" x $chunk);
 	$left -= $chunk;
     }
-
     return $bytes;
 }
 
@@ -905,32 +909,41 @@ sub emit_dir {
 # Copy the contents of a file
 sub emit_file {
     my($f, $parm) = @_;
-    my $sizeleft = $f->{size};
-    my $cpad = $f->{paddedsize} - $sizeleft;
     my $bytes = 0;
 
-    return if (!$sizeleft);	# Empty file
+    return if (!$f->{size});	# Empty file
 
     my $out = $parm->{out};
 
-    my $in;
-    if (open($in, '<', $f->{inpath})) {
-	binmode($in);
-	while ($sizeleft) {
-	    my $buf;
-	    my $chunk = read($in, $buf, min($BUFSIZ, $sizeleft));
-	    last if (!$chunk);
-	    $bytes += emit($out, $buf);
-	    $sizeleft -= $chunk;
+    if ($f->{populate}) {
+	$bytes = $f->{populate}->($f, $parm, $out);
+    } elsif (defined($f->{data})) {
+	$bytes = emit($out, $f->{data});
+    } elsif (defined($f->{inpath})) {
+	my $sizeleft = $f->{size};
+	my $in;
+	if (open($in, '<', $f->{inpath})) {
+	    binmode($in);
+	    while ($sizeleft) {
+		my $buf;
+		my $chunk = read($in, $buf, min($BUFSIZ, $sizeleft));
+		last if (!$chunk);
+		$bytes += emit($out, $buf);
+		$sizeleft -= $chunk;
+	    }
+	    close($in);
 	}
-	close($in);
+	if ($sizeleft) {
+	    print STDERR "%s: %s: %s\n", $opt{outfile}, $f->{inpath}, $!;
+	    $err++;
+	}
     }
 
-    if ($sizeleft) {
-	print STDERR "%s: %s: %s\n", $opt{outfile}, $f->{inpath}, $!;
+    if ($bytes > $f->{size}) {
+	print STDERR "%s: %s: output size overflow\n",
+	    $opt{outfile}, $opt{path};
 	$err++;
     }
-
     $bytes += emitzero($out, $f->{paddedsize} - $bytes);
     return $bytes;
 }

@@ -538,10 +538,10 @@ sub get_format_params($$) {
     #
     # Syntax: --reserve=<files>,<bytes>,<rootfiles>,<namelen>
     my @res = $opt{reserve} ? @{$opt{reserve}} : ();
-    my $resperfile = (1 + align_div($res[3] || 64, 13)) << 5;
-    $c += max($res[1] >> $cbshift, $res[0]);
-    my $resdir = $resperfile * $res[0];
-    $c += div_up($resdir, $cbytes);
+    $res[0] = max($res[0], $res[2]);
+    my $dirbytesperfile = (1 + div_up($res[3] || 64, 13)) << 5;
+    $c += max(div_up($res[1], $cbytes), $res[0]);
+    $c += div_up($dirbytesperfile * $res[0], $cbytes);
 
     # Subtract the cluster count for the root directory for the moment;
     # add them back later after FAT-type-specific modifications.
@@ -578,7 +578,7 @@ sub get_format_params($$) {
     # The root directory, if not FAT32
     my $rootdirsize;
     if ($fattype < 32) {
-	$rootdirsize = $root->{size} + ($res[2]*$resperfile);
+	$rootdirsize = $root->{size} + $res[2] * $dirbytesperfile;
 	if ($opt{strict}) {
 	    $rootdirsize = max($rootdirsize, ($fattype < 16 ? 256 : 512) << 5);
 	}
@@ -611,10 +611,10 @@ sub get_format_params($$) {
     return {
 	'root' => $root, 'rootdirsize' => $rootdirsize,
 	'sectors' => $sectors, 'cshift' => $cshift,
-	'csectors' => 1 << $cshift, 'cbytes' => 512 << $cshift,
+	'csectors' => 1 << $cshift, 'cbytes' => $cbytes,
 	'cbshift' => $cbshift, 'fattype' => $fattype,
 	'resv' => $resv, 'nfats' => $nfats, 'fatsize' => $fatsize,
-	'clust' => $c, 'secshift' => $secshift, 'sector' => 512,
+	'clust' => $c, 'secshift' => $secshift, 'sector' => $sector,
 	'mbrtype' => $mbrtype, 'gpttype' => $gpt_types[!!$opt{efi}],
 	'partalign' => $partalign, 'chs' => $chs, 'media' => $media
     };

@@ -1155,34 +1155,34 @@ Usage: $0 [options] [-o] outfile [[destination]::]input_path...
              :: alone as a prefix indicates that the entire input_path
              should be used as the destination name, not just its contents.
 Options:
--o, --output            Specify the output file (- for standard output)
-    --flat, --no-part   Do not create a partition table
-    --part              Create a partion table, either MBR or GPT [default]
-    --mbr               Create an MBR partition table
-    --gpt               Create a GPT partition table [default with --efi]
--e ,--efi, --uefi       Mark the partition as an EFI system partition
--b, --boot, --active    Mark the partition as legacy BIOS bootable
--L, --label=<name>	Set the filesystem volume name
--H, --heads=#           Define heads per cylinder for legacy geometry [255]
--S, --secpertrack=#     Define sectors per track legacy geometry [63]
--v, --verbose[=#]       Set message verbosity
+-o, --output             Specify the output file (- for standard output)
+    --flat, --no-part    Do not create a partition table
+    --part               Create a partion table, either MBR or GPT [default]
+    --mbr                Create an MBR partition table
+    --gpt[=<partitions>] Create a GPT partition table [default with --efi]
+-e ,--efi, --uefi        Mark the partition as an EFI system partition
+-b, --boot, --active     Mark the partition as legacy BIOS bootable
+-L, --label=<name>	 Set the filesystem volume name
+-H, --heads=#            Define heads per cylinder for legacy geometry [255]
+-S, --secpertrack=#      Define sectors per track legacy geometry [63]
+-v, --verbose[=#]        Set message verbosity
 -r, --reserve=<files>,<bytes>,<rootfiles>,<namelen>
-                        Specify additional space to reserve in the filesystem
-            files:      Specify the minimum number of (small) new files [0]
-            bytes:      Specify additional bytes of free space [0]
-            rootfiles:  Indicate how may of <files> may be in / [0]
-            namelen:    Assumed maximum filename length for new files [64]
--s, --strict            Strictly adhere to recommended filesystem parameters
--a, --align             Align to cluster sizes multiples (for physical media)
-    --volid=<id>        Set the volume ID to <id> (8 hex digits)
-    --partid=<id>       Set the partition ID to <id> (GUID, GPT only)
-    --diskid=<id>       Set the disk ID to <id> (GUID for GPT, 8 hex for MBR)
--U, --utc               Create time stamps in UTC, not local time
--D, --date=<date>       Force the time stamp of all files to <date>
--C, --creator=<name>    Set the filesystem creator name to <name> [FatImage]
-    --print-offset      Print filesystem offset in the image after completion
--V, --version           Display the version information
--h, --help              Display this help text
+                         Specify additional space to reserve in the filesystem
+             files:      Specify the minimum number of (small) new files [0]
+             bytes:      Specify additional bytes of free space [0]
+             rootfiles:  Indicate how may of <files> may be in / [0]
+             namelen:    Assumed maximum filename length for new files [64]
+-s, --strict             Strictly adhere to recommended filesystem parameters
+-a, --align              Align to cluster sizes multiples (for physical media)
+    --volid=<id>         Set the volume ID to <id> (8 hex digits)
+    --partid=<id>        Set the partition ID to <id> (GUID, GPT only)
+    --diskid=<id>        Set the disk ID to <id> (GUID for GPT, 8 hex for MBR)
+-U, --utc                Create time stamps in UTC, not local time
+-D, --date=<date>        Force the time stamp of all files to <date>
+-C, --creator=<name>     Set the filesystem creator name to <name> [FatImage]
+    --print-offset       Print filesystem offset in the image after completion
+-V, --version            Display the version information
+-h, --help               Display this help text
 EOF
     exit($err);
 }
@@ -1236,10 +1236,10 @@ sub do_options($@) {
 	    $opt{output} = $truth ? get_arg($args, $os) : File::Spec->devnull();
 	} elsif ($os =~ /^(?:e|-efi|-uefi)$/) {
 	    $opt{efi} = $truth;
-	} elsif ($os =~ /^(?:g|-gpt)$/) {
+	} elsif ($os =~ /^(?:g|-gpt)(=(\d+))$/) {
 	    if ($truth) {
 		$opt{part} = $GPT;
-		$opt{gptent} = get_arg_uint($args,$os,-1);
+		$opt{gptent} = $2+0 if ($1);
 	    } else {
 		$opt{part} = $FLAT unless ($opt{part} == $MBR);
 	    }

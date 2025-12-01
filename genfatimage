@@ -27,11 +27,10 @@ my $myversion = '0.0.1';
 my %opt = ();
 
 # Constants for partition type; the ordering matters for command-line parsing.
-# parsing
+my $ANYPART = 0;
 my $FLAT    = 1;
-my $ANYPART = 2;
-my $MBR     = 3;
-my $GPT     = 4;
+my $MBR     = 2;
+my $GPT     = 3;
 
 # The FAT and GPT Unicode encoding (UTF-16LE)
 my $FATUNI = Encode::find_encoding('UTF-16LE');
@@ -530,6 +529,9 @@ sub get_format_params($$) {
     my $fattype;
     my $nfats = $opt{strict} ? 2 : 1;
 
+    # Partition table alignment quantum
+    my $partalign = max($salign, $opt{strict} ? 64 : 1);
+
     # Reserved space; if the "extra files" part is set make sure there is at
     # least one free cluster per file, and enough space to put any
     # reserved files in subdirectories.
@@ -586,7 +588,8 @@ sub get_format_params($$) {
 
     # CHS geometry, in case someone actually that still cares...
     my $chs = [0, $opt{h} || 255, $opt{s} || 63];
-    $chs->[0] = div_up($sectors+$salign, $chs->[1]*$chs->[2]);
+    $chs->[0] = div_up($sectors+($opt{part} == $FLAT ? 0 : $partalign),
+		       $chs->[1]*$chs->[2]);
 
     # Suitable MBR type
     my $mbrtype;
@@ -613,7 +616,7 @@ sub get_format_params($$) {
 	'resv' => $resv, 'nfats' => $nfats, 'fatsize' => $fatsize,
 	'clust' => $c, 'secshift' => $secshift, 'sector' => 512,
 	'mbrtype' => $mbrtype, 'gpttype' => $gpt_types[!!$opt{efi}],
-	'chs' => $chs, 'media' => $media
+	'partalign' => $partalign, 'chs' => $chs, 'media' => $media
     };
 }
 
@@ -1043,17 +1046,14 @@ sub make_filesystem($) {
     my $csectors = $parm->{csectors};
 
     # Block alignment in sectors
-    my $align     = $opt{align} ? $csectors : 1;
+    my $align     = $parm->{partalign};
     my $gptsize   = div_up(max($opt{gptent}, $opt{strict} ? 128 : 1),
 			   $parm->{sector} >> 7);
     my $startsec  = 0;
     my $endsec    = 0;
     my $sectors   = $parm->{sectors};
     if ($opt{part} == $ANYPART) {
-	$opt{part} = $opt{efi} || ($sectors + $align) > 0xffffffff
-	    ? $GPT : $MBR;
-    } elsif (!$opt{part}) {
-	$opt{part} = $opt{efi} ? $GPT : $FLAT;
+	$opt{part} = $opt{efi} || ($sectors+$align) > 0xffffffff ? $GPT : $MBR;
     }
     if ($opt{part} == $GPT) {
 	$startsec   = $gptsize + 2; # +2 for PMBR, header
@@ -1246,7 +1246,7 @@ sub do_options($@) {
 	    }
 	} elsif ($os =~ /^(?:p|-part)$/) {
 	    if ($truth) {
-		$opt{part} = $ANYPART unless ($opt{part} > $ANYPART);
+		$opt{part} = $ANYPART unless ($opt{part} > $FLAT);
 	    } else {
 		$opt{part} = $FLAT;
 	    }

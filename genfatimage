@@ -9,6 +9,7 @@ use utf8;
 no indirect;
 
 use Crypt::Random::Source;
+use Date::Parse;
 use Digest::CRC qw(crc32);
 use Encode;
 use Fcntl qw(:DEFAULT :mode);
@@ -808,12 +809,10 @@ sub emitzero($$) {
 
 sub dosdate($) {
     my($time) = @_;
-
-    my @lt = localtime($time);
+    my @lt = $opt{utc} ? gmtime($time) : localtime($time);
 
     $lt[5] -= 80;		# Convert year to 1980-based
     $lt[4] += 1;		# Convert month to 1-based
-
     if ($lt[5] < 0) {
 	@lt = (0, 0, 0, 1, 1, 0);
     } elsif ($lt[5] > 127) {
@@ -829,7 +828,7 @@ sub dir_shortent($$$$$) {
 
     $size = 0 if ($attr & ($DIR|$VOL));
 
-    my $datetime = dosdate($date);
+    my $datetime = $opt{date} || dosdate($date);
     return pack('A11Ca8vVvV', $name, $attr, '',
 		$clustno >> 16, $datetime, $clustno & 0xffff, $size);
 }
@@ -1066,6 +1065,7 @@ sub make_filesystem($) {
     $sectors   = align_up($sectors + $startsec + $endsec, $align);
     $endsec    = $sectors - $endsec;
     my $fssec  = $endsec  - $startsec;
+    my $start  = $startsec << $parm->{secshift};
 
     # Update with the actually generated layout
     finalize_format_params($root, $startsec, $fssec);
@@ -1074,7 +1074,7 @@ sub make_filesystem($) {
 	    "%s: filesystem @ 0x%08x, data @ 0x%08x\n",
 	    $opt{outfile}, $parm->{fattype}, $fssec, $parm->{clust},
 	    $parm->{cbytes},
-	    $opt{outfile}, $startsec << $parm->{secshift}, $parm->{dataoffset};
+	    $opt{outfile}, $start, $parm->{dataoffset};
     }
     assign_clusters($root);
     if ($opt{verbose} >= 1) {
@@ -1082,6 +1082,8 @@ sub make_filesystem($) {
 	    $opt{outfile}, $parm->{clust} - ($parm->{endclust}-2),
 	    $parm->{clust};
     }
+
+    print $start, "\n" if ($opt{print_offset});
 
     # Output the image
     my $out;
@@ -1106,8 +1108,8 @@ sub make_filesystem($) {
     }
 
     my $bytes = emit($out, @part[0 ... 2]);
-    $bytes += emitzero($out, ($startsec << 9) - $bytes);
-    die unless ($bytes == ($startsec << 9));
+    $bytes += emitzero($out, $start - $bytes);
+    die unless ($bytes == $start);
 
     # The boot sector/superblock
     $bytes += emit_superblock($root, $parm);
@@ -1123,10 +1125,10 @@ sub make_filesystem($) {
     $bytes += populate_with($root, $parm, $FILE, \&emit_file);
 
     # Finally, output the backup GPT
-    $bytes += emitzero($out, ($endsec << 9) - $bytes);
+    $bytes += emitzero($out, ($endsec << $parm->{secshift}) - $bytes);
     $bytes += emit($out, @part[2 ... 3]);
 
-    die unless ($bytes == ($sectors << 9));
+    die unless ($bytes == ($sectors << $parm->{secshift}));
     close($out);
 }
 
@@ -1142,29 +1144,30 @@ Usage: $0 [options] [-o] outfile [[destination]::]input_path...
 Options:
 -o, --output            Specify the output file (- for standard output)
     --flat, --no-part   Do not create a partition table
-    --part              Create a partion table, either MBR or GPT (default)
+    --part              Create a partion table, either MBR or GPT [default]
     --mbr               Create an MBR partition table
     --gpt               Create a GPT partition table [default with --efi]
 -e ,--efi, --uefi       Mark the partition as an EFI system partition
 -b, --boot, --active    Mark the partition as legacy BIOS bootable
--L, --label=name	Set the filesystem volume name
+-L, --label=<name>	Set the filesystem volume name
 -H, --heads=#           Define heads per cylinder for legacy geometry [255]
 -S, --secpertrack=#     Define sectors per track legacy geometry [63]
 -v, --verbose[=#]       Set message verbosity
--r, --reserve=files,bytes,rootfiles,namelen
-                        Specify additional space to reserve in the filesystem.
-                        All parameters are optional.
-            files:      Specify the minimum number of (small) new files
-            bytes:      Specify additional bytes of free space
-            rootfiles:  Indicate how may of <files> may be in the root
-                        directory (applicable to FAT12/16 only)
+-r, --reserve=<files>,<bytes>,<rootfiles>,<namelen>
+                        Specify additional space to reserve in the filesystem
+            files:      Specify the minimum number of (small) new files [0]
+            bytes:      Specify additional bytes of free space [0]
+            rootfiles:  Indicate how may of <files> may be in / [0]
             namelen:    Assumed maximum filename length for new files [64]
 -s, --strict            Strictly adhere to recommended filesystem parameters
 -a, --align             Align to cluster sizes multiples (for physical media)
     --volid=<id>        Set the volume ID to <id> (8 hex digits)
     --partid=<id>       Set the partition ID to <id> (GUID, GPT only)
     --diskid=<id>       Set the disk ID to <id> (GUID for GPT, 8 hex for MBR)
+-U, --utc               Create time stamps in UTC, not local time
+-D, --date=<date>       Force the time stamp of all files to <date>
 -C, --creator=<name>    Set the filesystem creator name to <name> [FatImage]
+    --print-offset      Print filesystem offset in the image after completion
 -V, --version           Display the version information
 -h, --help              Display this help text
 EOF
@@ -1173,14 +1176,11 @@ EOF
 sub get_arg($$;$) {
     my($args,$os,$truth) = @_;
 
-    $truth = 1 unless (defined($truth));
-    return undef if (!$truth);
+    return undef if (defined($truth) && !$truth);
     return $1 if ($os =~ /^-.*?=(.*)$/);	# = separated argument
     return undef if ($truth < 0);		# Missing optional argument
     my $arg = shift(@$args);
-    if (!defined($arg)) {
-	die "$0: option -$os requires an argument\n";
-    }
+    die "$0: option -$os requires an argument\n" if (!defined($arg));
     return $arg;
 }
 sub get_arg_uints($$;$$) {
@@ -1215,9 +1215,9 @@ sub get_arg_uint($$;$) {
 sub do_options($@) {
     my $args = shift(@_);	# Argument list pointer
 
-    foreach my $os (@_) {
-	my $truth = 1;
-	$truth = 0 if ($os =~ s/^-no-/-/);
+    foreach my $optn (@_) {
+	my $os = $optn;
+	my $truth = ($os !~ s/^-no-?([^=]+)$/-$1/);
 
 	if ($os =~ /^(?:o|-output)$/) {
 	    $opt{output} = $truth ? get_arg($args, $os) : File::Spec->devnull();
@@ -1250,30 +1250,36 @@ sub do_options($@) {
 	    } else {
 		$opt{part} = $FLAT;
 	    }
-	} elsif ($os =~ /^(?:r|-reserve)$/) {
+	} elsif ($os =~ /^(?:r|-reserve)(?:=.*)?$/) {
 	    $opt{reserve} = get_arg_uints($args,$os,$truth,4);
-	} elsif ($os =~ /^(?:v|-verbose)$/) {
-	    $opt{verbose} = $truth ? $opt{verbose}+1 : 0;
+	} elsif ($os =~ /^(?:v|-verbose)(=(\d+))?$/) {
+	    $opt{verbose} = !$truth ? 0 : $1 ? $2+0 : $opt{verbose}+1;
 	} elsif ($os =~ /^(?:q|-quiet)$/) {
 	    $opt{verbose} = $truth ? 0 : max($opt{verbose}, 1);
-	} elsif ($os =~ /^(?:H|-heads)$/) {
+	} elsif ($os =~ /^(?:H|-heads)(?:=.*)?$/) {
 	    $opt{h} = get_arg_uint($args, $os,$truth);
-	} elsif ($os =~ /^(?:S|-secpertrack)$/) {
+	} elsif ($os =~ /^(?:S|-secpertrack)(?:=.*)?$/) {
 	    $opt{s} = get_arg_uint($args, $os,$truth);
-	} elsif ($os =~ /^(?:L|n|-label|-name|-volume(?:-?name)?)$/) {
+	} elsif ($os =~ /^(?:L|n|-label|-name|-volume(?:-?name)?)(?:=.*)?$/) {
 	    $opt{volname} = get_arg($args,$os,$truth) . '';
 	} elsif ($os =~ /^(?:s|-strict)$/) {
 	    $opt{strict} = $truth;
 	} elsif ($os =~ /^(?:a|-align)$/) {
 	    $opt{align} = $truth;
-	} elsif ($os eq '-diskid') {
+	} elsif ($os =~ /^-diskid(?:=.*)?$/) {
 	    $opt{diskid} = get_arg($args,$os,$truth);
-	} elsif ($os eq '-partid') {
+	} elsif ($os =~ /^-partid(?:=.*)?$/) {
 	    $opt{partid} = get_arg($args,$os,$truth);
-	} elsif ($os eq '-volid') {
+	} elsif ($os =~ /^-volid(?:=.*)?$/) {
 	    $opt{volid} = get_arg($args,$os,$truth);
-	} elsif ($os =~ /^(?:C|-creator)$/) {
+	} elsif ($os =~ /^(?:C|-creator)(?:=.*)?$/) {
 	    $opt{creator} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^(?:D|-date(?:time)?)(?:=.*)?$/) {
+	    $opt{date} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^(?:U|-utc|-gmt)$/) {
+	    $opt{utc} = $truth;
+	} elsif ($os =~ /^-print-offset$/) {
+	    $opt{print_offset} = $truth;
 	} elsif ($os =~ /^(?:h|-help)$/) {
 	    usage(0);
 	} elsif ($os =~ /^(?:V|-version)$/) {
@@ -1306,18 +1312,25 @@ sub parse_options(@_) {
 	    do_options(\@args, split(//, $1));
 	}
     }
-
     $opt{outfile} = shift(@args) unless (defined($opt{outfile}));
+
     return @args;		# Input files
 }
 
 my(@inputs) = parse_options(@ARGV);
 if (!@inputs) {
-    usage(1);
+    die "$0: no input files (see --help for usage)\n";
 }
 
 # Hopefully correct...?!
 binmode(STDERR, ':encoding(UTF-8)');
+
+# Date/time override
+if (defined($opt{date})) {
+    my $date = str2time($opt{date}, $opt{utc} ? '+0000' : undef);
+    die "$0: invalid date option: $opt{date}\n" if (!defined($date));
+    $opt{date} = dosdate($date);
+}
 
 my $root = read_inputs(@inputs);
 exit(1) if ($err);

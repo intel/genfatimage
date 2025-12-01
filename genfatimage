@@ -19,6 +19,10 @@ use IPC::Open3;
 
 die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
 
+# Program name and version
+my $myname    = 'genfatimage';
+my $myversion = '0.0.1';
+
 # Options structure
 my %opt = ();
 
@@ -119,26 +123,25 @@ sub guid_str($) {
     return sprintf('%08X-%04X-%04X-%04X-%04X%08X', @w);
 }
 
-sub to_chs($;$) {
-    my($lba, $hs) = @_;
-    $hs = [255, 63] unless (defined($hs));
-    my $s = ($lba % $hs->[1]) + 1;
-    my $t = $lba / $hs->[1];
-    my $h = $t % $hs->[0];
-    my $c = $t / $hs->[0];
-    ($c,$h,$s) = (1023,$hs->[0]-1,$hs->[1]) if ($c > 1023);
+sub to_chs($$) {
+    my($lba, $chs) = @_;
+    my $s = ($lba % $chs->[2]) + 1;
+    my $t = $lba / $chs->[2];
+    my $h = $t % $chs->[1];
+    my $c = $t / $chs->[1];
+    ($c,$h,$s) = (1023,$chs->[1]-1,$chs->[2]) if ($c > 1023);
     return pack('C3', $h, ($c >> 2)|$s, $c & 0xff);
 }
 # Create a minimal MBR partition table with one single partition.
 sub gen_mbr($$$;$$$)
 {
-    my($part_start, $part_len, $part_type, $hs, $active, $id) = @_;
+    my($part_start, $part_len, $part_type, $chs, $active, $id) = @_;
     my $part_end = min($part_start+$part_len-1, 0xffffffff);
     my $pe;
     if ($part_start <= 0xffffffff) {
 	$pe = pack('Ca3Ca3VV',
-		   $active ? 0x80 : 0, to_chs($part_start, $hs),
-		   $part_type, to_chs($part_end, $hs), $part_start, $part_len);
+		   $active ? 0x80 : 0, to_chs($part_start, $chs),
+		   $part_type, to_chs($part_end, $chs), $part_start, $part_len);
     }
     return pack('Cv.a*@440a4va64v', 0xe9, $KILLOFFS-3, $KILLOFFS,
 		$KILLBOOT, $id, 0, $pe, 0xaa55);
@@ -150,11 +153,11 @@ sub gen_mbr($$$;$$$)
 # $gpt_len is the desired size of the GPT array in sectors.
 sub gen_gpt($$$$$;$$$$) {
     my($disk_len, $part_start, $part_len, $part_type,
-       $gpt_len, $part_name, $disk_guid, $part_guid, $hs) = @_;
+       $gpt_len, $part_name, $disk_guid, $part_guid, $chs) = @_;
     my @blks;
 
     # PMBR - per spec the PMBR has no disk ID
-    $blks[0] = gen_mbr(1, $disk_len-1, 0xee, $hs);
+    $blks[0] = gen_mbr(1, $disk_len-1, 0xee, $chs);
 
     # GPT partition array
     $blks[2] = pack('a16a16Q<Q<Q<a142v.', $part_type, $part_guid,
@@ -291,12 +294,8 @@ sub mktreenode($@) {
 sub inputnode($$) {
     my($root, $inpath) = @_;
 
-    my $dest;
-    my @dest;
-    if ($inpath =~ /^(.*)::(.*)$/) {
-	$inpath = $1;
-	$dest   = $2;
-    }
+    $inpath =~ s/^(.*?):://;
+    my $destpath = $1;
 
     my @st = stat($inpath);
     if (!@st) {
@@ -305,17 +304,17 @@ sub inputnode($$) {
 	return;
     }
 
-    if (!defined($dest)) {
+    my @dest;
+    if (!defined($destpath)) {
 	@dest = ();
-    } elsif ($dest eq '') {
+    } elsif ($destpath eq '') {
 	@dest = pathlist($inpath, 1);
     } else {
-	@dest = pathlist($dest, 0);
+	@dest = pathlist($destpath, 0);
     }
 
-    $dest = mktreenode($root, @dest);
+    my $dest = mktreenode($root, @dest);
     $dest->{inpath} = $inpath if (defined($dest));
-
     return $dest;
 }
 
@@ -519,10 +518,13 @@ my @gpt_types = (
 # These will be made exact by finalize_format_params() later.
 sub get_format_params($$) {
     my($root, $cshift) = @_;
+    my $secshift = 9;
+    my $sector = 1 << $secshift;
     my $csize = 1 << $cshift;
-    my $cbytes = $csize << 9;
+    my $cbshift = $cshift + $secshift;
+    my $cbytes = 1 << $cbshift;
     my $salign = $opt{align} ? $csize : 1;
-    my $balign = $salign << 9;
+    my $balign = $salign << $secshift;
 
     my $c = count_clusters($root, $cshift);
     my $fattype;
@@ -531,9 +533,12 @@ sub get_format_params($$) {
     # Reserved space; if the "extra files" part is set make sure there is at
     # least one free cluster per file, and enough space to put any
     # reserved files in subdirectories.
-    my @res = $opt{reserve} ? @{$opt{reserve}} : (0);
-    $c += max($res[0] >> ($cshift+9), $res[1]);
-    my $resdir = ($res[1] * (div_up($opt{namelen},13) + 1)) << 5;
+    #
+    # Syntax: --reserve=<files>,<bytes>,<rootfiles>,<namelen>
+    my @res = $opt{reserve} ? @{$opt{reserve}} : ();
+    my $resperfile = (1 + align_div($res[3] || 64, 13)) << 5;
+    $c += max($res[1] >> $cbshift, $res[0]);
+    my $resdir = $resperfile * $res[0];
     $c += div_up($resdir, $cbytes);
 
     # Subtract the cluster count for the root directory for the moment;
@@ -546,27 +551,22 @@ sub get_format_params($$) {
     # Nybbles! per FAT entry (using bits here can cause overflow
     # on 32-bit platforms.)
     if ($c < 0xff5) {
-	# FAT12
 	$fattype = 12;
     } elsif ($c < 0xfff5) {
-	# FAT16
 	$fattype = 16;
     } elsif ($c < 0x0ffffff5) {
-	# FAT32
 	$fattype = 32;
-	# Require cluster size >= 4096 and size 512MiB+; some
-	# versions of Windows apparently have problems othersie
-	return undef if ($cshift < 3 || $sectors < 512*2048);
-	# Root directory is a cluster chain
-	$c += $rootclusts;
+	$c += $rootclusts;	# Root directory is a cluster chain
+	if ($opt{strict}) {
+	    return undef if ($cshift < 3 || $sectors < 0x1000000);
+	}
     } else {
-	# Invalid cshift; filesystem doesn't fit
-	return undef;
+	return undef;		# Would require exFAT
     }
 
     # Size of each FAT
-    my $fatsize = (($c+2) * $fattype + 1) >> 3;  # Bytes
-    $fatsize = align_up($fatsize, $balign) >> 9; # Sectors
+    my $fatsize = div_up(($c+2)*$fattype, 8);		 # Bytes
+    $fatsize = align_up($fatsize, $balign) >> $secshift; # Sectors
     $sectors += $nfats*$fatsize;
 
     # Reserved sectors (in the FAT sense)
@@ -576,39 +576,44 @@ sub get_format_params($$) {
     # The root directory, if not FAT32
     my $rootdirsize;
     if ($fattype < 32) {
-	$rootdirsize = min($resdir + $root->{size}, 4095 << 9);
-	$rootdirsize = max($rootdirsize, $root->{size});
-	$rootdirsize = max($rootdirsize, 512 << 5) if ($opt{strict});
+	$rootdirsize = $root->{size} + ($res[2]*$resperfile);
+	if ($opt{strict}) {
+	    $rootdirsize = max($rootdirsize, ($fattype < 16 ? 256 : 512) << 5);
+	}
 	$rootdirsize = align_up($rootdirsize, $balign);
-	$sectors += $rootdirsize >> 9;
+	$sectors += $rootdirsize >> $secshift;
     }
 
-    # Dummy geometry
-    my $hs = [$opt{h} || 255, $opt{s} || 63];
+    # CHS geometry, in case someone actually that still cares...
+    my $chs = [0, $opt{h} || 255, $opt{s} || 63];
+    $chs->[0] = div_up($sectors+$salign, $chs->[1]*$chs->[2]);
 
     # Suitable MBR type
     my $mbrtype;
     if ($opt{efi}) {
-	$mbrtype = 0xef;
+	$mbrtype = 0xef;	# For MBR only, not PMBR
     } elsif ($fattype == 12) {
 	$mbrtype = 0x01;
     } elsif ($fattype == 16) {
 	$mbrtype =
-	    $sectors < 0x10000 ? 0x04 :
-	    $sectors < (($hs->[0]*$hs->[1]) << 10) ? 0x06 : 0x0e;
+	    $sectors < 0x10000 ? 0x04 : $chs->[0] <= 1024 ? 0x06 : 0x0e;
     } else {
 	$mbrtype = 0x0c;
     }
+
+    my $media = 0xf8;
+    $media = 0xf0 if ($opt{part} == $FLAT && $chs->[0] <= 256);
+
     # Generated filesystem image parameters. May be an overestimate.
     return {
 	'root' => $root, 'rootdirsize' => $rootdirsize,
 	'sectors' => $sectors, 'cshift' => $cshift,
 	'csectors' => 1 << $cshift, 'cbytes' => 512 << $cshift,
-	'cbshift' => $cshift + 9, 'fattype' => $fattype,
+	'cbshift' => $cbshift, 'fattype' => $fattype,
 	'resv' => $resv, 'nfats' => $nfats, 'fatsize' => $fatsize,
-	'clust' => $c, 'secshift' => 9, 'sector' => 512,
+	'clust' => $c, 'secshift' => $secshift, 'sector' => 512,
 	'mbrtype' => $mbrtype, 'gpttype' => $gpt_types[!!$opt{efi}],
-	'media' => 0xf8, 'hs' => $hs
+	'chs' => $chs, 'media' => $media
     };
 }
 
@@ -946,7 +951,8 @@ sub emit_superblock($$) {
 		  $root->{clustno} ? 0 : $root->{paddedsize} >> 5,
 		  $sec16, $parm->{media},
 		  $fat < 32 ? $parm->{fatsize} : 0,
-		  $parm->{s}->[1], $parm->{hs}->[0], $parm->{hidden}, $sec32);
+		  $parm->{chs}->[2], $parm->{chs}->[1],
+		  $parm->{hidden}, $sec32);
     my $backupsb = 6;
 
     if ($fat >= 32) {
@@ -1093,10 +1099,10 @@ sub make_filesystem($) {
     if ($opt{part} == $GPT) {
 	@part = gen_gpt($sectors, $startsec, $fssec, $parm->{gpttype},
 			$gptsize, $root->{vollbl}->{name},
-			$root->{diskid}, $root->{partid}, $parm->{hs});
+			$root->{diskid}, $root->{partid}, $parm->{chs});
     } elsif ($opt{part} == $MBR) {
 	$part[0] = gen_mbr($startsec, $fssec, $parm->{mbrtype},
-			   $parm->{hs}, $parm->{active}, $root->{diskid});
+			   $parm->{chs}, $parm->{active}, $root->{diskid});
     }
 
     my $bytes = emit($out, @part[0 ... 2]);
@@ -1124,6 +1130,46 @@ sub make_filesystem($) {
     close($out);
 }
 
+sub usage(;$) {
+    my($err) = @_;
+    open(STDOUT, '>&', \*STDERR) if ($err);
+    print <<EOF;
+$myname $myversion
+Usage: $0 [options] [-o] outfile [[destination]::]input_path...
+             Inputs can be files or directories.
+             :: alone as a prefix indicates that the entire input_path
+             should be used as the destination name, not just its contents.
+Options:
+-o, --output            Specify the output file (- for standard output)
+    --flat, --no-part   Do not create a partition table
+    --part              Create a partion table, either MBR or GPT (default)
+    --mbr               Create an MBR partition table
+    --gpt               Create a GPT partition table [default with --efi]
+-e ,--efi, --uefi       Mark the partition as an EFI system partition
+-b, --boot, --active    Mark the partition as legacy BIOS bootable
+-L, --label=name	Set the filesystem volume name
+-H, --heads=#           Define heads per cylinder for legacy geometry [255]
+-S, --secpertrack=#     Define sectors per track legacy geometry [63]
+-v, --verbose[=#]       Set message verbosity
+-r, --reserve=files,bytes,rootfiles,namelen
+                        Specify additional space to reserve in the filesystem.
+                        All parameters are optional.
+            files:      Specify the minimum number of (small) new files
+            bytes:      Specify additional bytes of free space
+            rootfiles:  Indicate how may of <files> may be in the root
+                        directory (applicable to FAT12/16 only)
+            namelen:    Assumed maximum filename length for new files [64]
+-s, --strict            Strictly adhere to recommended filesystem parameters
+-a, --align             Align to cluster sizes multiples (for physical media)
+    --volid=<id>        Set the volume ID to <id> (8 hex digits)
+    --partid=<id>       Set the partition ID to <id> (GUID, GPT only)
+    --diskid=<id>       Set the disk ID to <id> (GUID for GPT, 8 hex for MBR)
+-C, --creator=<name>    Set the filesystem creator name to <name> [FatImage]
+-V, --version           Display the version information
+-h, --help              Display this help text
+EOF
+    exit($err);
+}
 sub get_arg($$;$) {
     my($args,$os,$truth) = @_;
 
@@ -1205,7 +1251,7 @@ sub do_options($@) {
 		$opt{part} = $FLAT;
 	    }
 	} elsif ($os =~ /^(?:r|-reserve)$/) {
-	    $opt{reserve} = get_arg_uints($args,$os,$truth,2);
+	    $opt{reserve} = get_arg_uints($args,$os,$truth,4);
 	} elsif ($os =~ /^(?:v|-verbose)$/) {
 	    $opt{verbose} = $truth ? $opt{verbose}+1 : 0;
 	} elsif ($os =~ /^(?:q|-quiet)$/) {
@@ -1228,10 +1274,13 @@ sub do_options($@) {
 	    $opt{volid} = get_arg($args,$os,$truth);
 	} elsif ($os =~ /^(?:C|-creator)$/) {
 	    $opt{creator} = get_arg($args,$os,$truth);
-	} elsif ($os =~ /^(?:W|-win(?:nt)?)$/) {
-	    $opt{winnt} = $truth;
+	} elsif ($os =~ /^(?:h|-help)$/) {
+	    usage(0);
+	} elsif ($os =~ /^(?:V|-version)$/) {
+	    print "$myname $myversion\n";
+	    exit(0);
 	} else {
-	    die "$0: unknown option: -$os\n";
+	    die "$0: unknown option: -$os (--help for help)\n";
 	}
     }
 }
@@ -1264,12 +1313,7 @@ sub parse_options(@_) {
 
 my(@inputs) = parse_options(@ARGV);
 if (!@inputs) {
-    die <<EOF;
-Usage: $0 [options] outfile input_path[::[destination]] ...
-       Inputs can be files or directories.
-       :: alone as a suffix indicates that the entire input_path
-       should be used as the destination name, not just its contents.
-EOF
+    usage(1);
 }
 
 # Hopefully correct...?!

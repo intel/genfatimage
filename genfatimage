@@ -540,7 +540,7 @@ sub get_format_params($$) {
     my @res = $opt{reserve} ? @{$opt{reserve}} : ();
     $res[0] = max($res[0], $res[2]);
     my $dirbytesperfile = (1 + div_up($res[3] || 64, 13)) << 5;
-    $c += max(div_up($res[1], $cbytes), $res[0]);
+    $c += $res[0] + div_up($res[1], $cbytes);
     $c += div_up($dirbytesperfile * $res[0], $cbytes);
 
     # Subtract the cluster count for the root directory for the moment;

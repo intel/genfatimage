@@ -14,7 +14,6 @@ use Digest::CRC qw(crc32);
 use Encode;
 use Fcntl qw(:DEFAULT :mode);
 use File::Spec;
-use File::Temp qw(tempfile);
 use IO::Handle;
 use IPC::Open3;
 

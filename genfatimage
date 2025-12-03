@@ -26,7 +26,6 @@ my %opt = (
     # Defaults, including ones taken from the environment.
     'verbose' => $ENV{'V'},
     'volname' => $ENV{'VOLNAME'},
-    'creator' => 'FatImage',
     'gptent' => 1,		# Minimum number of GPT entries
     'pad' => 1,			# Pad image by default
     'backup_gpt' => 1		# Generate backup GPT
@@ -963,7 +962,6 @@ sub emit_superblock($$) {
     my $sec32 = $parm->{sectors};
     my $sec16 = ($fat < 32 && $sec32 <= 0xffff) ? $sec32 : 0;
 
-    $opt{winnt} = $opt{strict} unless (defined($opt{winnt}));
     $opt{creator} = 'WINNT4.1' if ($opt{winnt});
 
     my $bs = pack('CvA8vCvCvvCvvvVV',
@@ -1375,9 +1373,12 @@ if (!@inputs) {
 binmode(STDERR, ':encoding(UTF-8)');
 
 # Postprocessing of some options
+unless (defined($opt{creator})) {
+    $opt{creator} = $opt{strict} ? 'WINNT4.1' : 'FatImage';
+}
 if ($opt{media}) {
-    $opt{strict} = 1;
-    $opt{align}  = 1;
+    $opt{strict} = 1 unless (defined($opt{strict})); # AFTER setting {creator}
+    $opt{align}  = 1 unless (defined($opt{align}));
 }
 $opt{date} = dosdate(mystr2time($opt{date}, $opt{utc})) if ($opt{date} ne '');
 

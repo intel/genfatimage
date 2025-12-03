@@ -121,8 +121,9 @@ sub guid(@) {
 }
 sub rand_guid() {
     my @b = unpack('C*', rand_bytes(16));
-    $b[7] = ($b[7] & 0x0f) | 0x40; # Version 4 (random)
-    $b[8] = ($b[8] & 0x3f) | 0x80; # Variant 1
+    # Version 4: random, version 8: custom algorithm
+    $b[7] = ($b[7] & 0x0f) | ($opt{repeatable} ? 0x80 : 0x40);
+    $b[8] = ($b[8] & 0x3f) | 0x80;
     return pack('C*', @b);
 }
 sub parse_guid($) {

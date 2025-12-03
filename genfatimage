@@ -1136,9 +1136,11 @@ sub make_filesystem($) {
     $bytes += populate_with($root, $parm, $DIR,  \&emit_dir);
     $bytes += populate_with($root, $parm, $FILE, \&emit_file);
 
-    # Finally, output the backup GPT
-    $bytes += emitzero($out, ($endsec << $parm->{secshift}) - $bytes);
-    $bytes += emit($out, @part[2 ... 3]);
+    # Finally, output the backup GPT if there is one
+    if ($opt{pad} || $opt{part} == $GPT) {
+	$bytes += emitzero($out, ($endsec << $parm->{secshift}) - $bytes);
+	$bytes += emit($out, @part[2 ... 3]);
+    }
 
     die unless ($bytes == ($sectors << $parm->{secshift}));
     close($out);
@@ -1150,9 +1152,15 @@ sub usage(;$) {
     print <<EOF;
 $myname $myversion
 Usage: $0 [options] [-o] outfile [[destination]::]input_path...
-             Inputs can be files or directories.
-             :: alone as a prefix indicates that the entire input_path
-             should be used as the destination name, not just its contents.
+
+Create and populate a FAT filesystem image. By default it tries to
+minimize the image as much as possible, leaving no free space and
+minimizing all data structures to the smallest possible.
+
+Inputs can be files or directories. :: alone as a prefix indicates
+that the entire input_path should be used as the destination name, not
+just its contents (for a directory) or terminal filename (for a file.)
+
 Options:
 -o, --output             Specify the output file (- for standard output)
     --flat, --no-part    Do not create a partition table
@@ -1171,8 +1179,11 @@ Options:
              bytes:      Specify additional bytes of free space [0]
              rootfiles:  Indicate how may of <files> may be in / [0]
              namelen:    Assumed maximum filename length for new files [64]
+-m, --media              Settings suitable for writing to physical media
 -s, --strict             Strictly adhere to recommended filesystem parameters
--a, --align              Align to cluster sizes multiples (for physical media)
+			 (enhances compatibility but generates larger images)
+-a, --align              Align data structures to multiples of the cluster size
+    --no-pad             Do not write out empty sectors at the end of the image
     --volid=<id>         Set the volume ID to <id> (8 hex digits)
     --partid=<id>        Set the partition ID to <id> (GUID, GPT only)
     --diskid=<id>        Set the disk ID to <id> (GUID for GPT, 8 hex for MBR)
@@ -1278,6 +1289,10 @@ sub do_options($@) {
 	    $opt{strict} = $truth;
 	} elsif ($os =~ /^(?:a|-align)$/) {
 	    $opt{align} = $truth;
+	} elsif ($os eq '-pad') {
+	    $opt{pad} = $truth;
+	} elsif ($os =~ /^(?:m|-media)$/) {
+	    $opt{media} = $truth;
 	} elsif ($os =~ /^-diskid(?:=.*)?$/) {
 	    $opt{diskid} = get_arg($args,$os,$truth);
 	} elsif ($os =~ /^-partid(?:=.*)?$/) {
@@ -1313,6 +1328,7 @@ sub parse_options(@_) {
     $opt{creator} = 'FatImage';
     $opt{namelen} = 64;		# Assumed maximum length per reserved file
     $opt{gptent}  = 1;		# Minimum number of GPT entries
+    $opt{pad} = 1;		# Pad image by default
 
     while (defined(my $arg = $args[0])) {
 	last if ($arg !~ /^-((-?).*)$/);
@@ -1329,6 +1345,19 @@ sub parse_options(@_) {
     return @args;		# Input files
 }
 
+sub mystr2date($$) {
+    my($date, $utc) = @_;
+    my $tz = $utc ? '+0000' : undef;
+    if ($date =~ /^\@?0?x([0-9a-f]+)$/i) {
+	$date = hex $date;
+    } elsif ($date =~ /^\@?\d+$/) {
+	$date += 0;
+    } elsif (!defined($date = str2date($date, $tz))) {
+	die "$0: invalid date: $date\n";
+    }
+    return $date;
+}
+
 my(@inputs) = parse_options(@ARGV);
 if (!@inputs) {
     die "$0: no input files (see --help for usage)\n";
@@ -1337,12 +1366,12 @@ if (!@inputs) {
 # Hopefully correct...?!
 binmode(STDERR, ':encoding(UTF-8)');
 
-# Date/time override
-if (defined($opt{date})) {
-    my $date = str2time($opt{date}, $opt{utc} ? '+0000' : undef);
-    die "$0: invalid date option: $opt{date}\n" if (!defined($date));
-    $opt{date} = dosdate($date);
+# Postprocessing of some options
+if ($opt{media}) {
+    $opt{strict} = 1;
+    $opt{align}  = 1;
 }
+$opt{date} = dosdate(mystr2time($opt{date}, $opt{utc})) if ($opt{date} ne '');
 
 my $root = read_inputs(@inputs);
 exit(1) if ($err);

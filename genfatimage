@@ -14,8 +14,6 @@ use Digest::CRC qw(crc32);
 use Encode;
 use Fcntl qw(:DEFAULT :mode);
 use File::Spec;
-use IO::Handle;
-use IPC::Open3;
 
 die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
 

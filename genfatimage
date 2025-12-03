@@ -22,7 +22,16 @@ my $myname    = 'genfatimage';
 my $myversion = '0.0.1';
 
 # Options structure
-my %opt = ();
+my %opt = (
+    # Defaults, including ones taken from the environment.
+    'verbose' => $ENV{'V'},
+    'volname' => $ENV{'VOLNAME'},
+    'creator' => 'FatImage',
+    'gptent' => 1,		# Minimum number of GPT entries
+    'pad' => 1,			# Pad image by default
+    'backup_gpt' => 1		# Generate backup GPT
+);
+
 
 # Constants for partition type; the ordering matters for command-line parsing.
 my $ANYPART = 0;
@@ -166,12 +175,14 @@ sub gen_gpt($$$$$;$$$$) {
 
     # GPT headers (primary and alternate)
     my $disk_guid = rand_guid();
-    foreach my $hdr ([1, 1, $disk_len-1, 2],
-		     [3, $disk_len-1, 1, $disk_len-$gpt_len-1]) {
+    my $backup_gpt = $disk_len - ($opt{backup_gpt} ? 1+$gpt_len : 0);
+    my @hdrs = ([1, 1, $backup_gpt+$gpt_len, 2]);
+    push(@hdrs, [3, $backup_gpt+$gpt_len, 1, $backup_gpt]) if ($opt{backup_gpt});
+    foreach my $hdr (@hdrs) {
 	my($i, $here, $there, $array) = @$hdr;
 	$blks[$i] =
 	    pack('a8VVVVQ<Q<Q<Q<a16Q<VVV', 'EFI PART', 0x10000, 92, 0, 0,
-		 $here, $there, $gpt_len+2,  $disk_len-$gpt_len-2,
+		 $here, $there, $gpt_len+2, $backup_gpt,
 		 $disk_guid, $array, $gpt_len << 2, 128, $array_crc);
 
 	my $hdr_crc = crc32($blks[$i]);
@@ -1065,7 +1076,10 @@ sub make_filesystem($) {
     }
     if ($opt{part} == $GPT) {
 	$startsec   = $gptsize + 2; # +2 for PMBR, header
-	$endsec     = $gptsize + 1;
+	if ($opt{backup_gpt}) {
+	    $endsec   = $gptsize + 1;
+	    $opt{pad} = 1;	# Padding to end of "disk" required
+	}
     } elsif ($opt{part} == $MBR) {
 	$startsec = 1;
     }
@@ -1133,13 +1147,12 @@ sub make_filesystem($) {
     $bytes += populate_with($root, $parm, $DIR,  \&emit_dir);
     $bytes += populate_with($root, $parm, $FILE, \&emit_file);
 
-    # Finally, output the backup GPT if there is one
-    if ($opt{pad} || $opt{part} == $GPT) {
+    # Finally, pad the image and output the backup GPT if there is one
+    if ($opt{pad}) {
 	$bytes += emitzero($out, ($endsec << $parm->{secshift}) - $bytes);
-	$bytes += emit($out, @part[2 ... 3]);
+	$bytes += emit($out, @part[2 ... 3]) if (defined($part[3]));
+	die unless ($bytes == ($sectors << $parm->{secshift}));
     }
-
-    die unless ($bytes == ($sectors << $parm->{secshift}));
     close($out);
 }
 
@@ -1186,6 +1199,7 @@ Options:
 			 (enhances compatibility but generates larger images)
 -a, --align              Align data structures to multiples of the cluster size
     --no-pad             Do not write out empty sectors at the end of the image
+    --no-backup-gpt      Omit the end-of-image backup GPT partition table
     --volid=<id>         Set the volume ID to <id> (8 hex digits)
     --partid=<id>        Set the partition ID to <id> (GUID, GPT only)
     --diskid=<id>        Set the disk ID to <id> (GUID for GPT, 8 hex for MBR)
@@ -1323,14 +1337,6 @@ sub do_options($@) {
 sub parse_options(@_) {
     my(@args) = @_;
     my $output;
-
-    # Defaults and environment variable overrides
-    $opt{verbose} = $ENV{'V'};
-    $opt{volname} = $ENV{'VOLNAME'};
-    $opt{creator} = 'FatImage';
-    $opt{namelen} = 64;		# Assumed maximum length per reserved file
-    $opt{gptent}  = 1;		# Minimum number of GPT entries
-    $opt{pad} = 1;		# Pad image by default
 
     while (defined(my $arg = $args[0])) {
 	last if ($arg !~ /^-((-?).*)$/);

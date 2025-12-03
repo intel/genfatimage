@@ -82,8 +82,19 @@ my $KILLOFFS = 0x180;		# Must be valid for MBR and FAT bootsector
 
 # Create a random (type 4) GUID
 # For Crypt::Random::Source < 0.13 using get_strong() would be better
+my $pseudo_random_seed = 0x12345678;
 sub rand_bytes($) {
     my($count) = @_;
+
+    if ($opt{repeatable}) {
+	# Stupid PRNG, but it doesn't need to be good...
+	my $o = '';
+	while ($count--) {
+	    $pseudo_random_seed = crc32($count, $pseudo_random_seed);
+	    $o .= pack('C', $pseudo_random_seed >> 24);
+	}
+	return $o;
+    }
 
     if (Crypt::Random::Source->VERSION < 0.13) {
 	return Crypt::Random::Source::get_strong($count);
@@ -1174,6 +1185,8 @@ A single : alone as an input_path prefix is exactly equivalent to no
 prefix at all; this can be used as an escape in case input_path itself
 may contain a double colon.
 
+Most options can be negated by prefixing their long forms with --no-.
+
 Options:
 -o, --output             Specify the output file (- for standard output)
     --flat, --no-part    Do not create a partition table
@@ -1203,7 +1216,7 @@ Options:
     --diskid=<id>        Set the disk ID to <id> (GUID for GPT, 8 hex for MBR)
 -U, --utc                Create time stamps in UTC, not local time
 -D, --date=<date>        Force the time stamp of all files to <date>
--C, --creator=<name>     Set the filesystem creator name to <name> [FatImage]
+-C, --creator=<name>     Set the filesystem creator name to <name> [GenFatIm]
     --print-offset       Print filesystem offset in the image after completion
 -V, --version            Display the version information
 -h, --help               Display this help text
@@ -1289,6 +1302,8 @@ sub do_options($@) {
 	    }
 	} elsif ($os =~ /^(?:r|-reserve)(?:=.*)?$/) {
 	    $opt{reserve} = get_arg_uints($args,$os,$truth,4);
+	} elsif ($os eq '-repeatable') {
+	    $opt{repeatable} = $truth;
 	} elsif ($os =~ /^(?:v|-verbose)(=(\d+))?$/) {
 	    $opt{verbose} = !$truth ? 0 : $1 ? $2+0 : $opt{verbose}+1;
 	} elsif ($os =~ /^(?:q|-quiet)$/) {
@@ -1374,7 +1389,7 @@ binmode(STDERR, ':encoding(UTF-8)');
 
 # Postprocessing of some options
 unless (defined($opt{creator})) {
-    $opt{creator} = $opt{strict} ? 'WINNT4.1' : 'FatImage';
+    $opt{creator} = $opt{strict} ? 'WINNT4.1' : 'GenFatIm';
 }
 if ($opt{media}) {
     $opt{strict} = 1 unless (defined($opt{strict})); # AFTER setting {creator}

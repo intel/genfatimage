@@ -293,7 +293,7 @@ sub mktreenode($@) {
 sub inputnode($$) {
     my($root, $inpath) = @_;
 
-    $inpath =~ s/^(.*?):://;
+    $inpath =~ s/^(?:([^:]*):)?://;
     my $destpath = $1;
 
     my @st = stat($inpath);
@@ -1151,15 +1151,20 @@ sub usage(;$) {
     open(STDOUT, '>&', \*STDERR) if ($err);
     print <<EOF;
 $myname $myversion
-Usage: $0 [options] [-o] outfile [[destination]::]input_path...
+Usage: $0 [options] [-o] outfile [[[destination]:]:]input_path...
 
 Create and populate a FAT filesystem image. By default it tries to
 minimize the image as much as possible, leaving no free space and
 minimizing all data structures to the smallest possible.
 
-Inputs can be files or directories. :: alone as a prefix indicates
-that the entire input_path should be used as the destination name, not
-just its contents (for a directory) or terminal filename (for a file.)
+Inputs can be files or directories. :: alone as an input_path prefix
+indicates that the entire input_path should be used as the destination
+name, not just its contents (for a directory) or terminal filename
+(for a file.)
+
+A single : alone as an input_path prefix is exactly equivalent to no
+prefix at all; this can be used as an escape in case input_path itself
+may contain a double colon.
 
 Options:
 -o, --output             Specify the output file (- for standard output)

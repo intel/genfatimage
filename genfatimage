@@ -14,6 +14,7 @@ use Digest::CRC qw(crc32);
 use Encode;
 use Fcntl qw(:DEFAULT :mode);
 use File::Spec;
+use Digest::SHA;
 
 die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
 
@@ -82,25 +83,21 @@ my $KILLOFFS = 0x180;		# Must be valid for MBR and FAT bootsector
 
 # Create a random (type 4) GUID
 # For Crypt::Random::Source < 0.13 using get_strong() would be better
-my $pseudo_random_seed = 0x12345678;
+my $pseudo_random_buf;		# For --repeatable
 sub rand_bytes($) {
     my($count) = @_;
+    my $o;
 
-    if ($opt{repeatable}) {
-	# Stupid PRNG, but it doesn't need to be good...
-	my $o = '';
-	while ($count--) {
-	    $pseudo_random_seed = crc32($count, $pseudo_random_seed);
-	    $o .= pack('C', $pseudo_random_seed >> 24);
-	}
-	return $o;
-    }
-
-    if (Crypt::Random::Source->VERSION < 0.13) {
-	return Crypt::Random::Source::get_strong($count);
+    if (defined($pseudo_random_buf)) {
+	$o = substr($pseudo_random_buf, 0, $count);
+	$pseudo_random_buf = substr($pseudo_random_buf, $count);
+    } elsif (Crypt::Random::Source->VERSION < 0.13) {
+	$o = Crypt::Random::Source::get_strong($count);
     } else {
-	return Crypt::Random::Source::get_weak($count);
+	$o = Crypt::Random::Source::get_weak($count);
     }
+    die if (length($o) != $count);
+    return $o;
 }
 
 # Decode optionally separated sequences of hexadecimal digits with
@@ -747,18 +744,15 @@ sub emit_fat12($$$) {
     $num <<= 12;
     $num |= $$hold;
     undef($$hold);
-    print $out pack('vC', $num & 0xffff, $num >> 16);
-    return 3;
+    return emit($out, pack('vC', $num & 0xffff, $num >> 16));
 }
 sub emit_fat16($$$) {
     my($out, $num, $hold) = @_;
-    print $out pack('v', $num & 0xffff);
-    return 2;
+    return emit($out, pack('v', $num & 0xffff));
 }
 sub emit_fat32($$$) {
     my($out, $num, $hold) = @_;
-    print $out pack('V', $num & 0x0fffffff);
-    return 4;
+    return emit($out, pack('V', $num & 0x0fffffff));
 }
 
 sub emit_one_fat($) {
@@ -770,13 +764,13 @@ sub emit_one_fat($) {
 	16 => \&emit_fat16,
 	32 => \&emit_fat32
     );
-    my $emit = $emit_func{$parm->{fattype}};
+    my $emit_fat = $emit_func{$parm->{fattype}};
     my $hold;
     my $bytes = 0;
 
     # The two special entries at the start
-    $bytes += $emit->($out, $parm->{media} - 256, \$hold);
-    $bytes += $emit->($out, -1, \$hold);
+    $bytes += $emit_fat->($out, $parm->{media} - 256, \$hold);
+    $bytes += $emit_fat->($out, -1, \$hold);
 
     my $clustno = 2;
     foreach my $f (@{$root->{layout}}) {
@@ -785,45 +779,52 @@ sub emit_one_fat($) {
 	my $nclust = $f->{nclust};
 	while (--$nclust) {
 	    # Emit the *next* cluster number
-	    $bytes += $emit->($out, ++$clustno, \$hold);
+	    $bytes += $emit_fat->($out, ++$clustno, \$hold);
 	}
-	$bytes += $emit->($out, -1, \$hold); # End of cluster chain
+	$bytes += $emit_fat->($out, -1, \$hold); # End of cluster chain
 	$clustno++;
     }
 
     # Flush any partial output
     while (defined($hold)) {
-	$bytes += $emit->($out, 0, \$hold);
+	$bytes += $emit_fat->($out, 0, \$hold);
     }
 
-    $bytes += emitzero($out, ($parm->{fatsize} << 9) - $bytes);
+    $bytes += emit_zero($out, ($parm->{fatsize} << 9) - $bytes);
     return $bytes;
 }
 
 # Maximum chunk size for writezero() and emit_file()
 my $BUFSIZ = 1024*1024;
 
+sub emit_to_file($$) {
+    my($out,$s) = @_;
+    print { $out->{fh} } $s;
+}
+sub emit_to_hash($$) {
+    my($out,$s) = @_;
+    $out->{hash}->add($s);
+}
+
 sub emit($@) {
-    my $fh = shift(@_);
+    my $out = shift(@_);
     my $bytes = 0;
 
     foreach my $s (@_) {
-	$bytes += length($s);
-	print $fh $s;
+	$out->{emitfunc}->($out, $s);
+	my $len = length($s);
+	$bytes += $len;
+	$out->{bytes} += $len;
     }
     return $bytes;
 }
+sub emit_zero($$) {
+    my($out, $count) = @_;
+    my $bytes = 0;
 
-sub emitzero($$) {
-    my($fh, $bytes) = @_;
-    my $left = $bytes;
-
-    return 0 if ($left <= 0);
-
-    while ($left) {
-	my $chunk = min($left, $BUFSIZ);
-	print $fh ("\0" x $chunk);
-	$left -= $chunk;
+    while ($count > $bytes) {
+	my $chunk = min($count - $bytes, $BUFSIZ);
+	$bytes += emit($out, "\0" x $chunk);
     }
     return $bytes;
 }
@@ -919,7 +920,7 @@ sub emit_dir {
     }
 
     die if ($bytes != $dir->{size});
-    $bytes += emitzero($parm->{out}, $dir->{paddedsize} - $bytes);
+    $bytes += emit_zero($parm->{out}, $dir->{paddedsize} - $bytes);
     return $bytes;
 }
 
@@ -961,7 +962,7 @@ sub emit_file {
 	    $opt{outfile}, $opt{path};
 	$err++;
     }
-    $bytes += emitzero($out, $f->{paddedsize} - $bytes);
+    $bytes += emit_zero($out, $f->{paddedsize} - $bytes);
     return $bytes;
 }
 
@@ -1007,22 +1008,16 @@ sub emit_superblock($$) {
 			  $parm->{endclust},
 			  '', 0xaa550000);
 	$bytes += emit($out, $fsinfo);
-	$bytes += emitzero($out, ($backupsb - 2) << 9);
+	$bytes += emit_zero($out, ($backupsb - 2) << 9);
 	$bytes += emit($out, $bs, $fsinfo);
     }
-    $bytes += emitzero($out, ($parm->{resv} << $parm->{secshift}) - $bytes);
+    $bytes += emit_zero($out, ($parm->{resv} << $parm->{secshift}) - $bytes);
     return $bytes;
 }
 
 # Create long and short volume labels.
 sub create_vol_label($) {
     my($root) = @_;
-
-    $root->{diskid} = parse_guid($opt{diskid});
-    $root->{partid} = parse_guid($opt{partid});
-
-    my @vo = hexgroups($opt{volid},4,4);
-    $root->{volid} = @vo ? pack('vv',$vo[1],$vo[0]) : rand_bytes(4);
 
     my $vol = $opt{volname};
     $vol = 'EFI BOOT' if ($vol eq '' && $opt{efi});
@@ -1034,7 +1029,20 @@ sub create_vol_label($) {
 	set_node_type($root->{files}->{' :vol'} = $root->{vollbl}, $VOL);
     }
 
+}
+
+# Set disk, partition, and volume identifiers
+sub set_identifiers($) {
+    my($root) = @_;
+
+    $root->{diskid} = parse_guid($opt{diskid});
+    $root->{partid} = parse_guid($opt{partid});
+
+    my @vo = hexgroups($opt{volid},4,4);
+    $root->{volid} = @vo ? pack('vv',$vo[1],$vo[0]) : rand_bytes(4);
+
     if ($opt{verbose} >= 1) {
+	my $vol = $root->{vollbl}->{name};
 	my $vostr = sprintf('%04X-%04X',reverse unpack('v*', $root->{volid}));
 	print STDERR "$opt{outfile}: diskid ", guid_str($root->{diskid}) ,"\n";
 	print STDERR "$opt{outfile}: partid ", guid_str($root->{partid}), "\n";
@@ -1044,11 +1052,8 @@ sub create_vol_label($) {
     }
 }
 
-sub make_filesystem($) {
+sub create_layout($) {
     my($root) = @_;
-
-    create_vol_label($root);
-    prep_directories($root);
 
     # Compute a suitable cluster shift.
     my $parm = undef;
@@ -1097,7 +1102,14 @@ sub make_filesystem($) {
     $sectors   = align_up($sectors + $startsec + $endsec, $align);
     $endsec    = $sectors - $endsec;
     my $fssec  = $endsec  - $startsec;
-    my $start  = $startsec << $parm->{secshift};
+    $parm->{disk} = {
+	'align'    => $align,
+	'startsec' => $startsec,
+	'endsec'   => $endsec,
+	'fssec'    => $fssec,
+	'gptsize'  => $gptsize,
+	'sectors'  => $sectors
+    };
 
     # Update with the actually generated layout
     finalize_format_params($root, $startsec, $fssec);
@@ -1106,7 +1118,7 @@ sub make_filesystem($) {
 	    "%s: filesystem @ 0x%08x, data @ 0x%08x\n",
 	    $opt{outfile}, $parm->{fattype}, $fssec, $parm->{clust},
 	    $parm->{cbytes},
-	    $opt{outfile}, $start, $parm->{dataoffset};
+	    $opt{outfile}, $startsec << $parm->{secshift}, $parm->{dataoffset};
     }
     assign_clusters($root);
     if ($opt{verbose} >= 1) {
@@ -1115,33 +1127,33 @@ sub make_filesystem($) {
 	    $parm->{clust};
     }
 
-    print $start, "\n" if ($opt{print_offset});
+    print $startsec << $parm->{secshift}, "\n" if ($opt{print_offset});
+}
 
-    # Output the image
-    my $out;
-    if ($opt{outfile} eq '-') {
-	open($out, '&>', \*STDOUT);
-    } else {
-	open($out, '>', $opt{outfile});
-    }
-    die "$opt{outfile}: $!\n" unless (defined($out));
-    binmode($out);
-    $parm->{out} = $out;
+sub emit_image($$) {
+    my($root, $out) = @_;
+    my $parm = $root->{parm};
+    my $disk = $parm->{disk};
+
+    $out->{bytes} = 0;
+    $parm->{out}  = $out;
 
     # Create the partition table
     my @part; # MBR, GPT header, GPT array, backup GPT header
     if ($opt{part} == $GPT) {
-	@part = gen_gpt($sectors, $startsec, $fssec, $parm->{gpttype},
-			$gptsize, $root->{vollbl}->{name},
+	@part = gen_gpt($disk->{sectors}, $disk->{startsec},
+			$disk->{fssec}, $parm->{gpttype},
+			$disk->{gptsize}, $root->{vollbl}->{name},
 			$root->{diskid}, $root->{partid}, $parm->{chs});
     } elsif ($opt{part} == $MBR) {
-	$part[0] = gen_mbr($startsec, $fssec, $parm->{mbrtype},
-			   $parm->{chs}, $parm->{active}, $root->{diskid});
+	$part[0] = gen_mbr($disk->{startsec}, $disk->{fssec},
+			   $parm->{mbrtype}, $parm->{chs},
+			   $parm->{active}, $root->{diskid});
     }
 
     my $bytes = emit($out, @part[0 ... 2]);
-    $bytes += emitzero($out, $start - $bytes);
-    die unless ($bytes == $start);
+    $bytes += emit_zero($out,
+			($disk->{startsec} << $parm->{secshift}) - $bytes);
 
     # The boot sector/superblock
     $bytes += emit_superblock($root, $parm);
@@ -1157,12 +1169,14 @@ sub make_filesystem($) {
     $bytes += populate_with($root, $parm, $FILE, \&emit_file);
 
     # Finally, pad the image and output the backup GPT if there is one
-    if ($opt{pad}) {
-	$bytes += emitzero($out, ($endsec << $parm->{secshift}) - $bytes);
+    # This does not need to be included in the final hash, so...
+    if ($opt{pad} && $out->{fh}) {
+	$bytes += emit_zero($out,
+			    ($disk->{endsec} << $parm->{secshift}) - $bytes);
 	$bytes += emit($out, @part[2 ... 3]) if (defined($part[3]));
-	die unless ($bytes == ($sectors << $parm->{secshift}));
+	die unless ($bytes == ($disk->{sectors} << $parm->{secshift}));
     }
-    close($out);
+    return $bytes;
 }
 
 sub usage(;$) {
@@ -1400,5 +1414,44 @@ $opt{date} = dosdate(mystr2time($opt{date}, $opt{utc})) if ($opt{date} ne '');
 my $root = read_inputs(@inputs);
 exit(1) if ($err);
 
-make_filesystem($root);
+create_vol_label($root);
+prep_directories($root);
+create_layout($root);
+
+if ($opt{repeatable}) {
+    my %optsave = %opt;
+    $opt{verbose} = 0;
+    $opt{print_offset} = 0;
+    $pseudo_random_buf = "\xee" x 64;
+    set_identifiers($root);
+    my %ho = ('hash' => Digest::SHA->new(512), 'emitfunc' => \&emit_to_hash);
+    emit_image($root, \%ho);
+
+    %opt = %optsave;
+    $pseudo_random_buf = $ho{hash}->digest;
+}
+
+set_identifiers($root);	# Update identifiers
+
+my %oo = ('emitfunc' => \&emit_to_file);
+END {
+    if (defined($oo{filename}) && $oo{fh}) {
+	close($oo{fh});
+	unlink($oo{filename});
+    }
+}
+
+if ($opt{outfile} eq '-') {
+    $oo{fh} = \*STDOUT;
+} else {
+    $oo{filename} = $opt{outfile};
+    open($oo{fh}, '>', $oo{filename}) or die "$opt{outfile}: $!\n";
+}
+emit_image($root, \%oo);
+
+if (defined($oo{filename})) {
+    close($oo{fh});
+    undef($oo{filename});	# Don't delete
+}
+
 exit(0);

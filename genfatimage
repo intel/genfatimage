@@ -548,8 +548,7 @@ sub get_format_params($$) {
 
     my $sectors = $c << $cshift;
 
-    # Nybbles! per FAT entry (using bits here can cause overflow
-    # on 32-bit platforms.)
+    # FAT type == bits per entry
     if ($c < 0xff5) {
 	$fattype = 12;
     } elsif ($c < 0xfff5) {

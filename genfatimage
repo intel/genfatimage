@@ -605,10 +605,15 @@ sub get_format_params($$) {
 	$sectors += $rootdirsize >> $secshift;
     }
 
-    # CHS geometry, in case someone actually that still cares...
-    my $chs = [0, $opt{h} || 255, $opt{s} || 63];
-    $chs->[0] = div_up($sectors+($opt{part} == $FLAT ? 0 : $partalign),
-		       $chs->[1]*$chs->[2]);
+    # Crude attempt at geometry, in case someone actually that still cares...
+    my $chs = [];
+    my $chsec = $opt{part} == $FLAT ? 0 : $partalign;
+    my $floppy = $opt{part} == $FLAT && $chsec <= 10080;
+    $chs->[1] = $opt{h} || ($floppy ? ($chsec < 512 ? 1 : 2) : 255);
+    $chs->[2] = $opt{s} ||
+	($floppy ? div_up($chsec, $chs->[1]*($chsec < 1024 ? 40 : 80)) : 63);
+    $chs->[0] = div_up($chsec, $chs->[1]*$chs->[2]);
+    $floppy = 0 if ($chs->[0] > 255);
 
     # Suitable MBR type
     my $mbrtype;
@@ -623,8 +628,8 @@ sub get_format_params($$) {
 	$mbrtype = 0x0c;
     }
 
-    my $media = 0xf8;
-    $media = 0xf0 if ($opt{part} == $FLAT && $chs->[0] <= 256);
+    my $media = $floppy ? 0xf0 : 0xf8;
+    my $drive = $floppy ? 0x00 : 0x80;
 
     # Generated filesystem image parameters. May be an overestimate.
     return {
@@ -635,7 +640,8 @@ sub get_format_params($$) {
 	'resv' => $resv, 'nfats' => $nfats, 'fatsize' => $fatsize,
 	'clust' => $c, 'secshift' => $secshift, 'sector' => $sector,
 	'mbrtype' => $mbrtype, 'gpttype' => $gpt_types[!!$opt{efi}],
-	'partalign' => $partalign, 'chs' => $chs, 'media' => $media
+	'partalign' => $partalign,
+	'chs' => $chs, 'media' => $media, 'drive' => $drive
     };
 }
 
@@ -997,7 +1003,7 @@ sub emit_superblock($$) {
 		    $root->{clustno}, 1, $backupsb, '');
     }
 
-    $bs .= pack('CCCa4A11A8.a*.v', 0x80, 0, 0x29, $root->{volid},
+    $bs .= pack('CCCa4A11A8.a*.v', $parm->{drive}, 0, 0x29, $root->{volid},
 		$root->{vollbl}->{shortname}, "FAT$fat",
 		$KILLOFFS - length($bs), $KILLBOOT,
 		510 - length($bs), 0xaa55);

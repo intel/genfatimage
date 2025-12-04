@@ -84,9 +84,8 @@ my $KILLJMP  = $KILLOFFS < 0x82
     ? pack("CCC", 0xeb, $KILLOFFS-2, 0x90)
     : pack("Cv",  0xe9, $KILLOFFS-3);
 
-# Create a random (type 4) GUID
-# For Crypt::Random::Source < 0.13 using get_strong() would be better
-my $pseudo_random_buf;		# For --repeatable
+# Generate random or pseudorandom bytes depending on if --random is enabled
+my $pseudo_random_buf;		# Hash or dummy seed; undef for random
 sub rand_bytes($) {
     my($count) = @_;
     my $o;
@@ -125,7 +124,7 @@ sub guid(@) {
 sub rand_guid() {
     my @b = unpack('C*', rand_bytes(16));
     # Version 4: random, version 8: custom algorithm
-    $b[7] = ($b[7] & 0x0f) | ($opt{repeatable} ? 0x80 : 0x40);
+    $b[7] = ($b[7] & 0x0f) | ($opt{random} ? 0x40 : 0x80);
     $b[8] = ($b[8] & 0x3f) | 0x80;
     return pack('C*', @b);
 }
@@ -1235,6 +1234,7 @@ Options:
 -a, --align              Align data structures to multiples of the cluster size
     --no-pad             Do not write out empty sectors at the end of the image
     --no-backup-gpt      Omit the end-of-image backup GPT partition table
+-R, --random             Use random IDs by default instead of a repeatable hash
     --volid=<id>         Set the volume ID to <id> (8 hex digits)
     --partid=<id>        Set the partition ID to <id> (GUID, GPT only)
     --diskid=<id>        Set the disk ID to <id> (GUID for GPT, 8 hex for MBR)
@@ -1326,8 +1326,8 @@ sub do_options($@) {
 	    }
 	} elsif ($os =~ /^(?:r|-reserve)(?:=.*)?$/) {
 	    $opt{reserve} = get_arg_uints($args,$os,$truth,4);
-	} elsif ($os eq '-repeatable') {
-	    $opt{repeatable} = $truth;
+	} elsif ($os =~ /^(?:R|-random)$/) {
+	    $opt{random} = $truth;
 	} elsif ($os =~ /^(?:v|-verbose)(=(\d+))?$/) {
 	    $opt{verbose} = !$truth ? 0 : $1 ? $2+0 : $opt{verbose}+1;
 	} elsif ($os =~ /^(?:q|-quiet)$/) {
@@ -1428,7 +1428,7 @@ create_vol_label($root);
 prep_directories($root);
 create_layout($root);
 
-if ($opt{repeatable}) {
+if (!$opt{random}) {
     my %optsave = %opt;
     $opt{verbose} = 0;
     $opt{print_offset} = 0;

@@ -79,7 +79,10 @@ sub div_up($$) {
 
 # Code to kill a BIOS boot: 1: int $0x80; hlt; jmp 1b
 my $KILLBOOT = "\xcd\x18\xf4\xeb\xfb";
-my $KILLOFFS = 0x180;		# Must be valid for MBR and FAT bootsector
+my $KILLOFFS = 0x78;		# Per the exFAT specification 3.1.1
+my $KILLJMP  = $KILLOFFS < 0x82
+    ? pack("CCC", 0xeb, $KILLOFFS-2, 0x90)
+    : pack("Cv",  0xe9, $KILLOFFS-3);
 
 # Create a random (type 4) GUID
 # For Crypt::Random::Source < 0.13 using get_strong() would be better
@@ -157,8 +160,8 @@ sub gen_mbr($$$;$$$)
 		   $active ? 0x80 : 0, to_chs($part_start, $chs),
 		   $part_type, to_chs($part_end, $chs), $part_start, $part_len);
     }
-    return pack('Cv.a*@440a4va64v', 0xe9, $KILLOFFS-3, $KILLOFFS,
-		$KILLBOOT, $id, 0, $pe, 0xaa55);
+    return pack('a3.a*@440a4va64v', $KILLJMP, $KILLOFFS, $KILLBOOT,
+		$id, 0, $pe, 0xaa55);
 }
 
 # Create a minimal GPT partition table with one single partition.
@@ -977,8 +980,8 @@ sub emit_superblock($$) {
 
     $opt{creator} = 'WINNT4.1' if ($opt{winnt});
 
-    my $bs = pack('CvA8vCvCvvCvvvVV',
-		  0xe9, $KILLOFFS-3, $opt{creator},
+    my $bs = pack('a3A8vCvCvvCvvvVV',
+		  $KILLJMP, $opt{creator},
 		  $parm->{sector},
 		  $parm->{csectors}, $parm->{resv}, $parm->{nfats},
 		  $root->{clustno} ? 0 : $root->{paddedsize} >> 5,

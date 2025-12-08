@@ -508,9 +508,13 @@ sub mktreenode($@) {
 
 sub inputnode($$) {
     my($root, $inpath) = @_;
+    my $destpath;
+    my $keeppath;
 
-    $inpath =~ s/^(?:([^:]*):)?://;
-    my $destpath = $1;
+    if ($inpath =~ s/^(:|([^:]*)::)//) {
+	$destpath = $2;
+	$keeppath = $1 eq '::';
+    }
 
     my @st = stat($inpath);
     if (!@st) {
@@ -518,14 +522,20 @@ sub inputnode($$) {
 	$err++;
 	return;
     }
+    my $mode = $st[2];
 
     my @dest;
-    if (!defined($destpath)) {
+    my @ipl = pathlist($inpath, 1);
+    if ($keeppath) {
+	@dest = @ipl;
+    } elsif (!defined($destpath)) {
 	@dest = ();
-    } elsif ($destpath eq '') {
-	@dest = pathlist($inpath, 1);
+	push(@dest, $ipl[-1]) if (S_ISREG($mode));
     } else {
 	@dest = pathlist($destpath, 0);
+	if ($destpath =~ /^[\/\\]$/) {
+	    push(@dest, $ipl[-1]);
+	}
     }
 
     my $dest = mktreenode($root, @dest);
@@ -1659,16 +1669,16 @@ minimizing all data structures to the smallest possible.
 Inputs can be files or directories. By default, if the input is a
 directory, its input_path will be discarded entirely and the contents
 of that directory will be added to the root directory; if the input is
-a file, the filename will be used as its name and the file is added to
-the root directory.
+a file, the input filename will be used as its name and the file is
+added to the root directory.
 
 Pathnames that are invalid in FAT are converted unless
 --strict=filename is in use.
 
 The prefix \"destination::\" specifies that an input should be located
 at a certain destination path in the generated image. If the
-destination ends in / and the input is a file, the file will be
-located in the given directory.
+destination ends in \"/\", the input file name or last level directory
+name will be appended to the destination path.
 
 A prefix of \":\" is equivalent to no prefix at all. This is
 recommended if input_path may contain \"::\".

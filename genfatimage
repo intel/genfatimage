@@ -365,7 +365,6 @@ sub gen_gpt($$$$$;$$$$) {
     my $array_crc = crc32($blks[2]);
 
     # GPT headers (primary and alternate)
-    my $disk_guid = rand_guid();
     my $backup_gpt = $disk_len - ($opt{backup_gpt} ? 1+$gpt_len : 0);
     my @hdrs = ([1, 1, $backup_gpt+$gpt_len, 2]);
     push(@hdrs, [3, $backup_gpt+$gpt_len, 1, $backup_gpt]) if ($opt{backup_gpt});
@@ -1977,9 +1976,9 @@ if (!$opt{random}) {
     my %optsave = %opt;
     $opt{verbose} = 0;
     $opt{print_offset} = 0;
-    $pseudo_random_buf = "\xee" x 64;
+    $pseudo_random_buf = "\xee" x 48;
     set_identifiers($root);
-    my %ho = ('hash' => Digest::SHA->new(512), 'emitfunc' => \&emit_to_hash);
+    my %ho = ('hash' => Digest::SHA->new(384), 'emitfunc' => \&emit_to_hash);
     emit_image($root, \%ho);
 
     %opt = %optsave;

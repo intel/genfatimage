@@ -2028,9 +2028,9 @@ sub do_options($@) {
 	} elsif ($os =~ /^(?:R|-random)$/) {
 	    $opt{random} = $truth;
 	} elsif ($os =~ /^(?:v|-verbose)(=(\d+))?$/) {
-	    $opt{verbose} = !$truth ? 0 : $1 ? $2+0 : $opt{verbose}+1;
+	    $opt{verbose} = !$truth ? 0 : $1 ? $2+0 : max($opt{verbose}+1, 1);
 	} elsif ($os =~ /^(?:q|-quiet)$/) {
-	    $opt{verbose} = $truth ? 0 : max($opt{verbose}, 1);
+	    $opt{verbose} = $truth ? -1 : max($opt{verbose}, 0);
 	} elsif ($os =~ /^(?:H|-heads)(?:=.*)?$/) {
 	    $opt{h} = get_arg_uint($args, $os,$truth);
 	} elsif ($os =~ /^(?:S|-secpertrack)(?:=.*)?$/) {
@@ -2136,6 +2136,10 @@ if ($opt{media}) {
     $opt{align}  = 1 unless (defined($opt{align}));
 }
 $opt{date} = dosdate(mystr2time($opt{date}, $opt{utc})) if ($opt{date} ne '');
+
+if ($opt{efi} && $opt{exfat} && $opt{verbose} >= 0) {
+    print STDERR "$opt{outfile}: WARNING: EFI and exFAT are not compatible\n";
+}
 
 my $root = read_inputs(@inputs);
 exit(1) if ($err);

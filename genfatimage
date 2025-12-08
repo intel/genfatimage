@@ -21,6 +21,7 @@ die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
 # Program name and version
 my $myname    = 'genfatimage';
 my $myversion = '0.0.1';
+my $mycreator = 'GenFatIm';
 
 # Options structure
 my %opt = (
@@ -29,7 +30,23 @@ my %opt = (
     'volname' => $ENV{'VOLNAME'},
     'gptent' => 1,		# Minimum number of GPT entries
     'pad' => 1,			# Pad image by default
-    'backup_gpt' => 1		# Generate backup GPT
+    'backup_gpt' => 1,		# Generate backup GPT
+    'strict' => {}		# Strict flags, see below
+);
+
+# Strict flags
+my %strict_help = (
+    'volsize'   => 'Enforce filesystem type volume size limits',
+    'upcase'    => 'Use Microsoft encoding for upcase table (exFAT)',
+    'fats'      => 'Require two FATs (not exFAT)',
+    'mbrspace'  => 'Add space after partition table (MBR)',
+    'cluster'   => 'Max 32K clusters (not exFAT), min 4K (FAT32)',
+    'bootspace' => 'Enforce 32-sector boot area space (FAT32)',
+    'rootdir'   => 'Enforce minimum root directory size (FAT12/16)',
+    'gptsize'   => 'Size GPT to 128 partition entries (GPT)',
+    'creator'   => 'Set default system name to "WINNT4.1" (not exFAT)',
+    'flags'     => 'Error out on unknown --strict flags',
+    'filename'  => 'Error out on invalid filenames'
 );
 
 # Constants for partition types; the ordering matters for command-line parsing!
@@ -661,7 +678,7 @@ sub pathlist($;$) {
 	}
     }
 
-    die "$0: empty path?: \"$path\"" if (!@path);
+    die "$myname: empty path?: \"$path\"" if (!@path);
     return @path;
 }
 
@@ -691,10 +708,15 @@ sub normalize_filename($) {
     my($vn) = @_;
     # Normalize name; this affects the retained name
     $vn = decode_utf8($vn);	# Convert to characters
-    $vn =~ s/^\./_/;
-    $vn =~ s/[\s\.]$/_/;
-    $vn =~ tr/\"\*\/:<>?\\|/\'+;()!!/;
-    return $vn;
+    my $nn = $vn;
+    $nn =~ s/[\x00-\x1f\x7f"*\/:<>?\\|]/_/g;
+    $nn =~ s/^(\s)/_$1/;
+    $nn =~ s/([\.\s])$/$1_/;
+    if ($opt{strict}->{filename} && $nn ne $vn) {
+	print STDERR "$opt{outfile}: invalid FAT filename: \"$vn\"\n";
+	$err++;
+    }
+    return $nn;
 }
 
 sub set_node_type($$;$) {
@@ -844,9 +866,9 @@ sub add_input($;$) {
 	if ($st[7] > 0xffffffff) {
 	    $dest->{size} = 0xffffffff;
 	    $dest->{exsize} = $st[7];
-	    $root->{largefile} = 1;
+	    $dest->{root}->{largefile} = 1;
 	    if (!$opt{exfat}) {
-		print STDERR "$opt{outfile}: input file too large, need exFAT: $inpath\n";
+		print STDERR "$opt{outfile}: file too large, need exFAT: $inpath\n";
 		$err++;
 	    }
 	}
@@ -1020,10 +1042,10 @@ sub get_format_params($$;$) {
 
     my $c = count_clusters($root, $cbytes, $exfat);
     my $fattype;
-    my $nfats = (!$exfat && $opt{strict}) ? 2 : 1;
+    my $nfats = (!$exfat && $opt{strict}->{fats}) ? 2 : 1;
 
     # Partition table alignment quantum
-    my $partalign = max($salign, $opt{strict} ? 64 : 1);
+    my $partalign = max($salign, $opt{strict}->{partspace} ? 64 : 1);
 
     # Reserved space; if the "extra files" part is set make sure there is at
     # least one free cluster per file, and enough space to put any
@@ -1056,7 +1078,7 @@ sub get_format_params($$;$) {
     } elsif ($c < 0x0ffffff5) {
 	$fattype = 32;
 	$strictminsize = 1 << 29;
-	return undef if ($cshift < 3 && $opt{strict});
+	return undef if ($cshift < 3 && $opt{strict}->{cluster});
     } else {
 	return undef;		# Does not fit
     }
@@ -1067,7 +1089,7 @@ sub get_format_params($$;$) {
     if ($exfat) {
 	# Upcase table
 	$upcase_table =
-	    $opt{strict} || $cbytes >= length($upcase_table_msft)
+	    $opt{strict}->{upcase} || $cbytes >= length($upcase_table_msft)
 	    ? \$upcase_table_msft : \$upcase_table_minimal;
 	$c += div_up(length($$upcase_table), $cbytes);
 
@@ -1082,8 +1104,8 @@ sub get_format_params($$;$) {
 	$c += $bitmapclust;
     }
 
-    # For some filesystems, force a minimum size if strict
-    $c = max($c, div_up($strictsize, $cbytes)) if ($opt{strict});
+    # For FAT32 and exFAT, enforce a minimum size if strict
+    $c = max($c, div_up($strictminsize, $cbytes)) if ($opt{strict});
     my $sectors = $c << $cshift;
 
     # Size of each FAT
@@ -1093,7 +1115,7 @@ sub get_format_params($$;$) {
 
     # Reserved sectors (in the FAT sense)
     my $resv = 1;
-    $resv = $opt{strict} ? 32 : 8 if ($fattype == 32);
+    $resv = $opt{strict}->{bootspace} ? 32 : 8 if ($fattype == 32);
     $resv = 24 if ($exfat);
     $resv = align_up($resv, $salign);
     $sectors += $resv;
@@ -1102,7 +1124,7 @@ sub get_format_params($$;$) {
     my $rootdirsize;
     if ($fattype < 32) {
 	$rootdirsize = $root->{size} + $res[2] * $dirbytesperfile;
-	if ($opt{strict}) {
+	if ($opt{strict}->{rootdir}) {
 	    $rootdirsize = max($rootdirsize, ($fattype < 16 ? 256 : 512) << 5);
 	}
 	$rootdirsize = align_up($rootdirsize, $balign);
@@ -1787,7 +1809,8 @@ sub create_layout($) {
 
     # Block alignment in sectors
     my $align     = $parm->{partalign};
-    my $gptsize   = div_up(max($opt{gptent}, $opt{strict} ? 128 : 1),
+    my $gptsize   = div_up(max($opt{gptent},
+			       $opt{strict}->{gptsize} ? 128 : 1),
 			   $parm->{sector} >> 7);
     my $startsec  = 0;
     my $endsec    = 0;
@@ -1887,23 +1910,34 @@ sub emit_image($$) {
 
 sub usage(;$) {
     my($err) = @_;
-    open(STDOUT, '>&', \*STDERR) if ($err);
-    print <<EOF;
+    my $out = $err ? \*STDERR : \*STDOUT;
+    print $out <<EOF;
 $myname $myversion
-Usage: $0 [options] [-o] outfile [[[destination]:]:]input_path...
+Usage: $myname [options] [-o] outfile [[[destination]:]:]input_path...
 
 Create and populate a FAT filesystem image. By default it tries to
 minimize the image as much as possible, leaving no free space and
 minimizing all data structures to the smallest possible.
 
-Inputs can be files or directories. :: alone as an input_path prefix
-indicates that the entire input_path should be used as the destination
-name, not just its contents (for a directory) or terminal filename
-(for a file.)
+Inputs can be files or directories. By default, if the input is a
+directory, its input_path will be discarded entirely and the contents
+of that directory will be added to the root directory; if the input is
+a file, the filename will be used as its name and the file is added to
+the root directory.
 
-A single : alone as an input_path prefix is exactly equivalent to no
-prefix at all; this can be used as an escape in case input_path itself
-may contain a double colon.
+Pathnames that are invalid in FAT are converted unless
+--strict=filename is in use.
+
+The prefix \"destination::\" specifies that an input should be located
+at a certain destination path in the generated image. If the
+destination ends in / and the input is a file, the file will be
+located in the given directory.
+
+A prefix of \":\" is equivalent to no prefix at all. This is
+recommended if input_path may contain \"::\".
+
+A prefix of \"::\" alone as that the entire input_path should be used
+as the destination name.
 
 Most options can be negated by prefixing their long forms with --no-.
 
@@ -1926,8 +1960,9 @@ Options:
              rootfiles:  Indicate how may of <files> may be in / [0]
              namelen:    Assumed maximum filename length for new files [64]
 -m, --media              Settings suitable for writing to physical media
--s, --strict             Strictly adhere to recommended filesystem parameters
-			 (enhances compatibility but generates larger images)
+    --strict             Strictly adhere to recommended filesystem parameters
+    --strict=...         Fine grained control of strictness flags
+    --strict=help        Show detailed help about the --strict option
 -x, --exfat              Generate an exFAT filesystem if advantageous
 -X, --exfat=force        Unconditionally generate an exFAT filesystem
 -a, --align              Align data structures to multiples of the cluster size
@@ -1939,13 +1974,37 @@ Options:
     --diskid=<id>        Set the disk ID to <id> (GPT: GUID, MBR: 8 hex)
 -U, --utc                Create time stamps in UTC, not local time
 -D, --date=<date>        Force the time stamp of all files to <date>
--C, --creator=<name>     Set the filesystem creator name to <name> [GenFatIm]
+-C, --creator=<name>     Set the filesystem creator name to <name> [$mycreator]
     --print-offset       Print filesystem offset in the image after completion
 -V, --version            Display the version information
 -h, --help               Display this help text
 EOF
     exit($err);
 }
+sub strict_help($) {
+    my($err) = @_;
+    my $out = $err ? \*STDERR : \*STDOUT;
+
+    print $out <<EOF;
+--strict option syntax: --strict=[+-]flag[,flag...]
+
+If preceeded by +, add to existing flags.
+If preceeded by -, remove from existing flags.
+
+--strict without any argument is equivalent to --strict=all, which sets
+all flags.
+
+For forward compatibility reasons, unknown flags are ignored unless
+--strict=flags is specified.
+
+Available flags are:
+EOF
+
+    map { printf $out "    --strict=%-10s %s\n", $_, $strict_help{$_} }
+	sort(keys(%strict_help));
+    exit($err);
+}
+
 sub get_arg($$;$) {
     my($args,$os,$truth) = @_;
 
@@ -1953,7 +2012,7 @@ sub get_arg($$;$) {
     return $1 if ($os =~ /^-.*?=(.*)$/);	# = separated argument
     return undef if ($truth < 0);		# Missing optional argument
     my $arg = shift(@$args);
-    die "$0: option -$os requires an argument\n" if (!defined($arg));
+    die "$myname: option -$os requires an argument\n" if (!defined($arg));
     return $arg;
 }
 sub get_arg_uints($$;$$) {
@@ -1975,7 +2034,7 @@ sub get_arg_uints($$;$$) {
 	}
     }
     if (!@ns || scalar(@ns) > max($cmax,1)) {
-	die "$0: invalid argument to -$os: $arg\n";
+	die "$myname: invalid argument to -$os: $arg\n";
     }
     return \@ns;
 }
@@ -2037,15 +2096,33 @@ sub do_options($@) {
 	    $opt{s} = get_arg_uint($args, $os,$truth);
 	} elsif ($os =~ /^(?:L|n|-label|-name|-volume(?:-?name)?)(?:=.*)?$/) {
 	    $opt{volname} = get_arg($args,$os,$truth) . '';
-	} elsif ($os =~ /^(?:s|-strict)$/) {
-	    $opt{strict} = $truth;
+	} elsif ($os =~ /^(?:s|-strict)(=([+-]?)(.*))?$/) {
+	    my $flags = $3;
+	    my $sense = $2;
+	    strict_help(0) if ($flags eq 'help');
+	    $truth = 0 if ($sense eq '-' || $flags =~ /^(?:no|none|off|0)$/);
+	    $opt{strict} = {} if (!$sense); # Clear all flags
+	    if ($flags =~ /^(?:no|none|off|0|yes|all|1)$/) {
+		$flags = join(',', keys(%strict_help));
+	    }
+	    my $found_unknown;
+	    foreach my $flag (split(/,/, $flags)) {
+		$found_unknown = $flag if (!$strict_help{$flag});
+		$opt{strict}->{$flag} = $truth;
+	    }
+	    if (defined($found_unknown) && $truth && $opt{strict}->{flags}) {
+		print STDERR "$myname: invalid --strict flag: $found_unknown\n";
+		strict_help(1);
+	    }
 	} elsif ($os =~ /^(?:a|-align)$/) {
 	    $opt{align} = $truth;
 	} elsif ($os eq '-pad') {
 	    $opt{pad} = $truth;
-	} elsif ($os =~ /^(?:([Xx])|-exfat(=.*)?)$/) {
-	    $opt{exfat} = $truth && $2 ne 'no';
-	    $opt{exfat} = 2 if ($truth && ($1 eq 'X' || $2 eq 'force'));
+	} elsif ($os =~ /^(?:([Xx])|-exfat)(?:=(.*))?$/) {
+	    my($xx,$oo) = ($1,$2);
+	    $truth = 0 if ($oo =~ /^(?:no|never|off|0)$/);
+	    $truth = 2 if ($xx eq 'X' || $oo =~ /^(?:force|always|1)$/);
+	    $opt{exfat} = $truth;
 	} elsif ($os =~ /^(?:m|-media)$/) {
 	    $opt{media} = $truth;
 	} elsif ($os =~ /^-diskid(?:=.*)?$/) {
@@ -2068,7 +2145,7 @@ sub do_options($@) {
 	    print "$myname $myversion\n";
 	    exit(0);
 	} else {
-	    die "$0: unknown option: -$os (--help for help)\n";
+	    die "$myname: unknown option: -$os (--help for help)\n";
 	}
     }
 }
@@ -2111,7 +2188,7 @@ sub mystr2time($$) {
     } else {
 	my $tzstr = $utc ? '+0000' : undef;
 	if (!defined($time = str2time($date, $tzstr))) {
-	    die "$0: invalid date: $date\n";
+	    die "$myname: invalid date: $date\n";
 	}
 	my @lt = strptime($date, $tzstr);
 	$tz = $lt[6];
@@ -2121,7 +2198,7 @@ sub mystr2time($$) {
 
 my(@inputs) = parse_options(@ARGV);
 if (!@inputs) {
-    die "$0: no input files (see --help for usage)\n";
+    die "$myname: no input files (see --help for usage)\n";
 }
 
 # Hopefully correct...?!
@@ -2129,10 +2206,11 @@ binmode(STDERR, ':encoding(UTF-8)');
 
 # Postprocessing of some options
 unless (defined($opt{creator})) {
-    $opt{creator} = $opt{strict} ? 'WINNT4.1' : 'GenFatIm';
+    $opt{creator} = $opt{strict}->{creator} ? 'WINNT4.1' : $mycreator;
 }
 if ($opt{media}) {
-    $opt{strict} = 1 unless (defined($opt{strict})); # AFTER setting {creator}
+    map { $opt{strict}->{$_} = 1 unless (defined($opt{strict}->{$_})) }
+	qw(volsize upcase fats mbrspace bootspace rootdir gptsize);
     $opt{align}  = 1 unless (defined($opt{align}));
 }
 $opt{date} = dosdate(mystr2time($opt{date}, $opt{utc})) if ($opt{date} ne '');

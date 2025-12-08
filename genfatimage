@@ -689,7 +689,7 @@ sub genshortname($$$) {
 	my $xhead = substr($head, 0, 8-length($ctrtail));
 	my $xname = pack('A8A3', $xhead.$ctrtail, $ext);
 	if (!defined($shorthash->{$xname})) {
-	    if ($opt{verbose} >= 2) {
+	    if ($opt{verbose} >= 3) {
 		print STDERR "$opt{outfile}: short \"$xname\" for \"$fullname\"\n";
 	    }
 	    $shorthash->{$xname} = $fullname;
@@ -1028,9 +1028,10 @@ sub assign_clusters($) {
     populate_with($root, $parm, $FILE,  \&assign_clust);
 
     if ($opt{verbose} >= 1) {
-	printf STDERR "%s: %d/%d clusters free\n",
-	    $opt{outfile}, $parm->{clust} - ($parm->{endclust}-2),
-	    $parm->{clust};
+	my $freeclust = $parm->{clust} - ($parm->{endclust}-2);
+	printf STDERR "%s: %d/%d clusters free (%dK)\n",
+	    $opt{outfile}, $freeclust, $parm->{clust},
+	    $freeclust << $parm->{cbshift} >> 10;
     }
     die if ($parm->{endclust} > $parm->{clust} + 2);
 
@@ -1593,12 +1594,20 @@ sub create_layout($) {
 
     # Update with the actually generated layout
     finalize_format_params($root, $startsec, $fssec);
-    if ($opt{verbose} >= 2) {
-	printf STDERR "%s: %s, %d sectors, %d clusters * %d bytes\n".
-	    "%s: filesystem @ 0x%08x, data @ 0x%08x\n",
-	    $opt{outfile}, $parm->{exfat} ? 'exFAT' : $parm->{fattype},
-	    $fssec, $parm->{clust}, $parm->{cbytes},
-	    $opt{outfile}, $startsec << $parm->{secshift}, $parm->{dataoffset};
+    if ($opt{verbose} >= 1) {
+	printf STDERR "%s: %s, %d clusters * %d bytes\n",
+	    $opt{outfile}, $parm->{exfat} ? 'exFAT' : 'FAT'.$parm->{fattype},
+	    $parm->{clust}, $parm->{cbytes};
+	printf STDERR "%s: image size is %d bytes\n",
+	    $opt{outfile}, $sectors << $parm->{secshift};
+
+	if ($opt{verbose} >= 2) {
+	    printf STDERR "%s: partition is %d sectors, image %d sectors\n",
+		$opt{outfile}, $fssec, $sectors;
+	    printf STDERR "%s: filesystem @ 0x%08x, data @ 0x%08x\n",
+		$opt{outfile}, $startsec << $parm->{secshift},
+		$parm->{dataoffset};
+	}
     }
     assign_clusters($root);
     print $startsec << $parm->{secshift}, "\n" if ($opt{print_offset});

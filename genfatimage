@@ -1706,7 +1706,7 @@ Options:
     --gpt[=<partitions>] Create a GPT partition table [default with --efi]
 -e ,--efi, --uefi        Mark the partition as an EFI system partition
 -b, --boot, --active     Mark the partition as legacy BIOS bootable
--L, --label=<name>	 Set the filesystem volume name
+-L, --label=<name>       Set the filesystem volume name
 -H, --heads=#            Define heads per cylinder for legacy geometry [255]
 -S, --secpertrack=#      Define sectors per track legacy geometry [63]
 -v, --verbose[=#]        Set message verbosity

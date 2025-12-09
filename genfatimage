@@ -20,7 +20,7 @@ die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
 
 # Program name and version
 my $myname    = 'genfatimage';
-my $myversion = '0.0.1';
+my $myversion = '0.10';
 my $mycreator = 'GenFatIm';
 
 # Options structure

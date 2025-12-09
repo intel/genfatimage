@@ -1,0 +1,153 @@
+genfatimage
+===========
+
+`genfatimage` is a simple tool to create a minimized FAT or exFAT
+filesystem populated from a set of files on a host system, optionally
+with a specified amount of extra space.
+
+`genfatimage` is written in Perl and requires the following packages
+from CPAN; these may very well be included with your Perl interpreter
+distribution:
+
+```
+Crypt::Random::Source
+Date::Parse
+Digest::CRC
+Digest::SHA
+Encode
+PathTools
+indirect
+```
+
+As it is written in Perl, it *should* work on just about any platform.
+
+Usage
+-----
+
+By default `genfatimage` creates an image with a partition table.
+Use the `--flat` or `--floppy` options to create only a filesystem image.
+The partition table is MBR unless *either* the `--gpt` or `--efi` options
+are specified, *or* the image exceeds 2 TiB in size.
+
+The `--efi` option creates a GPT-partitioned image (unless `--mbr`
+is also specified) and marks it as an EFI system partition. Use this to create
+a bootable EFI/UEFI image.
+
+The image is by default heavily optimized for size, and is
+primarily intended to be used for virtual filesystem images or other
+applications where data persistence is not a requirement. To generate
+an image intended to be written to physical media, especially writable
+media, the `--media` option selects safer defaults and is strongly
+recommended.
+
+The `--strict` option disables all optimizations that may affect
+compatibility with non-compliant FAT implementations; see
+`genfatimage --strict=help` for additional information.
+
+The output of `genfatimage` can be piped to another command if
+desired, by setting the output filename to `-`.
+
+Usage documentation is provided by running `genfatimage --help`:
+
+```
+genfatimage 0.10
+Usage: genfatimage [options] [-o] outfile [[[destination]:]:]input_path...
+
+Create and populate a FAT filesystem image. By default it tries to
+minimize the image as much as possible, leaving no free space and
+minimizing all data structures to the smallest possible.
+
+Inputs can be files or directories. By default, if the input is a
+directory, its input_path will be discarded entirely and the contents
+of that directory will be added to the root directory; if the input is
+a file, the input filename will be used as its name and the file is
+added to the root directory.
+
+Pathnames that are invalid in FAT are converted unless
+--strict=filename is in use.
+
+The prefix "destination::" specifies that an input should be located
+at a certain destination path in the generated image. If the
+destination ends in "/", the input file name or last level directory
+name will be appended to the destination path.
+
+A prefix of ":" is equivalent to no prefix at all. This is
+recommended if input_path may contain "::".
+
+A prefix of "::" alone as that the entire input_path should be used
+as the destination name.
+
+Most options can be negated by prefixing their long forms with --no-.
+
+Options:
+-o, --output             Specify the output file (- for standard output)
+    --flat, --floppy     Do not create a partition table
+    --part               Create a partion table, either MBR or GPT [default]
+    --mbr                Create an MBR partition table
+    --gpt[=<partitions>] Create a GPT partition table [default with --efi]
+-e ,--efi, --uefi        Mark the partition as an EFI system partition
+-b, --boot, --active     Mark the partition as legacy BIOS bootable
+-L, --label=<name>       Set the filesystem volume name
+-H, --heads=#            Define heads per cylinder for legacy geometry [255]
+-S, --secpertrack=#      Define sectors per track legacy geometry [63]
+-v, --verbose[=#]        Set message verbosity
+-r, --readonly           Set the readonly flag on every file
+    --archive            Set the archive flag on every file
+-R, --reserve=<files>,<bytes>,<rootfiles>,<namelen>
+                         Specify additional space to reserve in the filesystem
+             files:      Specify the minimum number of (small) new files [0]
+             bytes:      Specify additional bytes of free space [0]
+             rootfiles:  Indicate how may of <files> may be in / [0]
+             namelen:    Assumed maximum filename length for new files [64]
+-m, --media              Settings suitable for writing to physical media
+-s, --strict             Strictly adhere to recommended filesystem parameters
+    --strict=...         Fine grained control of strictness flags
+    --strict=help        Show detailed help about the --strict option
+-x, --exfat              Generate an exFAT filesystem if advantageous
+-X, --exfat=force        Unconditionally generate an exFAT filesystem
+-a, --align              Align data structures to multiples of the cluster size
+    --no-pad             Do not write out empty sectors at the end of the image
+    --no-backup-gpt      Omit the end-of-image backup GPT partition table
+    --random             Use random IDs by default instead of a repeatable hash
+    --volid=<id>         Set the volume ID to <id> (exFAT: GUID, FAT: 8 hex)
+    --partid=<id>        Set the partition ID to <id> (GPT only: GUID)
+    --diskid=<id>        Set the disk ID to <id> (GPT: GUID, MBR: 8 hex)
+-U, --utc                Create time stamps in UTC, not local time
+-D, --date=<date>        Force the time stamp of all files to <date>
+-C, --creator=<name>     Set the filesystem creator name to <name> [GenFatIm]
+    --print-offset       Print filesystem offset in the image after completion
+-V, --version            Display the version information
+-h, --help               Display this help text
+```
+
+Authorship and License
+----------------------
+
+`genfatimage` was developed by H. Peter Anvin of Intel Corporation, and
+is released under the 2-clause BSD license:
+
+> Copyright 2025 Intel Corporation - All Rights Reserved
+>
+> Redistribution and use in source and binary forms, with or without
+> modification, are permitted provided that the following conditions are
+> met:
+>
+> 1. Redistributions of source code must retain the above copyright
+>    notice, this list of conditions and the following disclaimer.
+>
+> 2. Redistributions in binary form must reproduce the above copyright
+>    notice, this list of conditions and the following disclaimer in the
+>    documentation and/or other materials provided with the
+>    distribution.
+>
+> THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+> “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+> LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+> A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+> HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+> SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+> LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+> DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+> THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+> (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+> OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

@@ -618,8 +618,10 @@ sub add_input($;$) {
 		$err++;
 	    }
 	}
-	# Readonly bit
-	$dest->{flags} = !($mode & S_IWRITE) || $opt{ro} ? 1 : 0;
+	# Readonly and archive bits
+	$dest->{flags} = 0x00;
+	$dest->{flags} |= 0x01 if (!($mode & S_IWRITE) || $opt{readonly});
+	$dest->{flags} |= 0x20 if ($opt{archive});
     } else {
 	printf STDERR "$opt{outfile}: warning: skipping non-regular file: $inpath\n";
 	return;
@@ -1708,14 +1710,16 @@ Options:
 -H, --heads=#            Define heads per cylinder for legacy geometry [255]
 -S, --secpertrack=#      Define sectors per track legacy geometry [63]
 -v, --verbose[=#]        Set message verbosity
--r, --reserve=<files>,<bytes>,<rootfiles>,<namelen>
+-r, --readonly           Set the readonly flag on every file
+    --archive            Set the archive flag on every file
+-R, --reserve=<files>,<bytes>,<rootfiles>,<namelen>
                          Specify additional space to reserve in the filesystem
              files:      Specify the minimum number of (small) new files [0]
              bytes:      Specify additional bytes of free space [0]
              rootfiles:  Indicate how may of <files> may be in / [0]
              namelen:    Assumed maximum filename length for new files [64]
 -m, --media              Settings suitable for writing to physical media
-    --strict             Strictly adhere to recommended filesystem parameters
+-s, --strict             Strictly adhere to recommended filesystem parameters
     --strict=...         Fine grained control of strictness flags
     --strict=help        Show detailed help about the --strict option
 -x, --exfat              Generate an exFAT filesystem if advantageous
@@ -1723,7 +1727,7 @@ Options:
 -a, --align              Align data structures to multiples of the cluster size
     --no-pad             Do not write out empty sectors at the end of the image
     --no-backup-gpt      Omit the end-of-image backup GPT partition table
--R, --random             Use random IDs by default instead of a repeatable hash
+    --random             Use random IDs by default instead of a repeatable hash
     --volid=<id>         Set the volume ID to <id> (exFAT: GUID, FAT: 8 hex)
     --partid=<id>        Set the partition ID to <id> (GPT only: GUID)
     --diskid=<id>        Set the disk ID to <id> (GPT: GUID, MBR: 8 hex)
@@ -1837,9 +1841,13 @@ sub do_options($@) {
 	    } else {
 		$opt{part} = $FLAT;
 	    }
-	} elsif ($os =~ /^(?:r|-reserve)(?:=.*)?$/) {
+	} elsif ($os =~ /^(?:R|-reserve)(?:=.*)?$/) {
 	    $opt{reserve} = get_arg_uints($args,$os,$truth,4);
-	} elsif ($os =~ /^(?:R|-random)$/) {
+	} elsif ($os =~ /^(?:r|-readonly)?$/) {
+	    $opt{readonly} = $truth;
+	} elsif ($os =~ /^(?:-archive)?$/) {
+	    $opt{archive} = $truth;
+	} elsif ($os =~ /^(?:-random)$/) {
 	    $opt{random} = $truth;
 	} elsif ($os =~ /^(?:v|-verbose)(=(\d+))?$/) {
 	    $opt{verbose} = !$truth ? 0 : $1 ? $2+0 : max($opt{verbose}+1, 1);

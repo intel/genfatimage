@@ -11,10 +11,10 @@ no indirect;
 use Crypt::Random::Source;
 use Date::Parse;
 use Digest::CRC qw(crc32);
+use Digest::SHA;
 use Encode;
 use Fcntl qw(:DEFAULT :mode);
 use File::Spec;
-use Digest::SHA;
 
 die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
 
@@ -1698,7 +1698,7 @@ Most options can be negated by prefixing their long forms with --no-.
 
 Options:
 -o, --output             Specify the output file (- for standard output)
-    --flat, --no-part    Do not create a partition table
+    --flat, --floppy     Do not create a partition table
     --part               Create a partion table, either MBR or GPT [default]
     --mbr                Create an MBR partition table
     --gpt[=<partitions>] Create a GPT partition table [default with --efi]
@@ -1825,7 +1825,7 @@ sub do_options($@) {
 	    } else {
 		$opt{part} = $FLAT unless ($opt{part} == $GPT);
 	    }
-	} elsif ($os =~ /^(?:f|-flat)$/) {
+	} elsif ($os =~ /^(?:-flat|-floppy)$/) {
 	    if ($truth) {
 		$opt{part} = $FLAT;
 	    } else {

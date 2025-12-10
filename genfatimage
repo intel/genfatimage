@@ -31,6 +31,7 @@ my %opt = (
     'gptent' => 1,		# Minimum number of GPT entries
     'pad' => 1,			# Pad image by default
     'backup_gpt' => 1,		# Generate backup GPT
+    'sparse' => 1,		# Sparse output
     'strict' => {}		# Strict flags, see below
 );
 
@@ -1125,10 +1126,34 @@ my $BUFSIZ = 1024*1024;
 
 sub emit_to_file($$) {
     my($out,$s) = @_;
-    print { $out->{fh} } $s;
+    my $flushing = !defined($s);
+    my $fh = $out->{fh};
+
+    $s =~ s/(\0+)$//;
+    my $zl = length($1);
+    if ($s ne '' || $flushing) {
+	if ($out->{sparse} && $out->{zeroes} >= $out->{sparse}) {
+	    my $whereto = tell($fh);
+	    if ($whereto >= 0) {
+		$fh->flush;
+		$whereto += $out->{zeroes};
+		if (truncate($fh,$whereto) && seek($fh,$whereto,0)) {
+		    die unless (tell($fh) == $whereto);
+		    $out->{zeroes} = 0;
+		}
+	    }
+	}
+	while ($out->{zeroes} > 0) {
+	    my $chunk = min($out->{zeroes}, $BUFSIZ);
+	    print $fh "\0" x $chunk;
+	    $out->{zeroes} -= $chunk;
+	}
+	print $fh $s;
+    }
+    $out->{zeroes} += $zl;
 }
-sub emit_to_hash($$) {
-    my($out,$s) = @_;
+sub emit_to_hash($$;$) {
+    my($out,$s,$flush) = @_;
     $out->{hash}->add($s);
 }
 
@@ -1137,6 +1162,7 @@ sub emit($@) {
     my $bytes = 0;
 
     foreach my $s (@_) {
+	next unless (defined($s));
 	$out->{emitfunc}->($out, $s);
 	my $len = length($s);
 	$bytes += $len;
@@ -1144,15 +1170,24 @@ sub emit($@) {
     }
     return $bytes;
 }
+sub emit_flush($) {
+    my($out) = @_;
+    $out->{emitfunc}->($out, undef);
+}
 sub emit_zero($$) {
     my($out, $count) = @_;
-    my $bytes = 0;
 
-    while ($count > $bytes) {
-	my $chunk = min($count - $bytes, $BUFSIZ);
-	$bytes += emit($out, "\0" x $chunk);
+    if (defined($out->{zeroes})) {
+	$out->{zeroes} += $count;
+	return $count;
+    } else {
+	my $bytes = 0;
+	while ($count > $bytes) {
+	    my $chunk = min($count - $bytes, $BUFSIZ);
+	    $bytes += emit($out, "\0" x $chunk);
+	}
+	return $bytes;
     }
-    return $bytes;
 }
 
 sub dosdate {
@@ -1662,6 +1697,7 @@ sub emit_image($$) {
 	$bytes += emit($out, @part[2 ... 3]) if (defined($part[3]));
 	die unless ($bytes == ($disk->{sectors} << $parm->{secshift}));
     }
+    emit_flush($out);
     return $bytes;
 }
 
@@ -1734,6 +1770,7 @@ Options:
 -U, --utc                Create time stamps in UTC, not local time
 -D, --date=<date>        Force the time stamp of all files to <date>
 -C, --creator=<name>     Set the filesystem creator name to <name> [$mycreator]
+    --sparse[=<chunk>]   Try to create a sparse output file (default)
     --print-offset       Print filesystem offset in the image after completion
 -V, --version            Display the version information
 -h, --help               Display this help text
@@ -1811,7 +1848,8 @@ sub do_options($@) {
 	my $truth = ($os !~ s/^-no-?([^=]+)$/-$1/);
 
 	if ($os =~ /^(?:o|-output)$/) {
-	    $opt{output} = $truth ? get_arg($args, $os) : File::Spec->devnull();
+	    $opt{outfile} = $truth
+		? get_arg($args, $os) : File::Spec->devnull();
 	} elsif ($os =~ /^(?:e|-efi|-uefi)$/) {
 	    $opt{efi} = $truth;
 	} elsif ($os =~ /^(?:g|-gpt)(=(\d+))$/) {
@@ -1854,9 +1892,9 @@ sub do_options($@) {
 	} elsif ($os =~ /^(?:q|-quiet)$/) {
 	    $opt{verbose} = $truth ? -1 : max($opt{verbose}, 0);
 	} elsif ($os =~ /^(?:H|-heads)(?:=.*)?$/) {
-	    $opt{h} = get_arg_uint($args, $os,$truth);
+	    $opt{h} = get_arg_uint($args,$os,$truth);
 	} elsif ($os =~ /^(?:S|-secpertrack)(?:=.*)?$/) {
-	    $opt{s} = get_arg_uint($args, $os,$truth);
+	    $opt{s} = get_arg_uint($args,$os,$truth);
 	} elsif ($os =~ /^(?:L|n|-label|-name|-volume(?:-?name)?)(?:=.*)?$/) {
 	    $opt{volname} = get_arg($args,$os,$truth) . '';
 	} elsif ($os =~ /^(?:s|-strict)(=([+-]?)(.*))?$/) {
@@ -1902,6 +1940,13 @@ sub do_options($@) {
 	    $opt{utc} = $truth;
 	} elsif ($os =~ /^-print-offset$/) {
 	    $opt{print_offset} = $truth;
+	} elsif ($os =~ /^-sparse(?:=.*)?$/) {
+	    if ($truth) {
+		my $chunk = get_arg_uint($args,$os,-1);
+		$opt{sparse} = defined($chunk) ? $chunk : 1;
+	    } else {
+		$opt{sparse} = 0;
+	    }
 	} elsif ($os =~ /^(?:h|-help)$/) {
 	    usage(0);
 	} elsif ($os =~ /^(?:V|-version)$/) {
@@ -2017,6 +2062,11 @@ if ($opt{outfile} eq '-') {
 } else {
     $oo{filename} = $opt{outfile};
     open($oo{fh}, '>', $oo{filename}) or die "$opt{outfile}: $!\n";
+}
+my @ost = stat($oo{fh});
+if ($opt{sparse} && S_ISREG($ost[2]) && $ost[11]) {
+    $oo{sparse} = max($opt{sparse}, $ost[11]);
+    $oo{zeroes} = 0;
 }
 emit_image($root, \%oo);
 

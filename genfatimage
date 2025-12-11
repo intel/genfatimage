@@ -13,15 +13,17 @@ use Date::Parse;
 use Digest::CRC qw(crc32);
 use Digest::SHA;
 use Encode;
-use Fcntl qw(:DEFAULT :mode);
+use Fcntl qw(:DEFAULT :mode :seek);
 use File::Spec;
+use POSIX;
 
 die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
 
 # Program name and version
-my $myname    = 'genfatimage';
-my $myversion = '0.10';
-my $mycreator = 'GenFatIm';
+my $myname		= 'genfatimage';
+my $myversion		= '0.10';
+my $mycreator		= 'GenFatIm';
+my $default_iosize	= 64 << 10;
 
 # Options structure
 my %opt = (
@@ -255,6 +257,13 @@ sub align_up($$) {
 sub div_up($$) {
     my($val, $divisor) = @_;
     return ($val + $divisor - 1)/$divisor;
+}
+# Compute -$a % $b giving a nonnegative remainder; assumes $a, $b >= 0
+sub npad($$) {
+    my($a, $b) = @_;
+    my $r = -$a % $b;
+    $r += $b if ($r < 0);
+    return $r;
 }
 
 # Code to kill a BIOS boot: 1: int $0x80; hlt; jmp 1b
@@ -566,10 +575,11 @@ sub cat_path($$) {
 sub node_date($) {
     my($node) = @_;
 
-    do {
-	return $node->{date} if (defined($node->{date}));
-    } while ($node = $node->{up});
-    return 0;
+    while ($node) {
+	return $node->{date} if ($node->{date});
+	$node = $node->{up};
+    }
+    return [(1 << 21) + (1 << 16), 0, 0, 0];
 }
 
 # Add an input file or directory to a directory node
@@ -585,6 +595,11 @@ sub add_input($;$) {
 	return;
     }
     my $mode = $st[2];
+    my $date = $opt{date};
+    if (!$date) {
+	$date = node_date($dest);
+	$date = dosdate($st[9]) if ($date->[3] < $st[9]);
+    }
 
     if (S_ISDIR($mode)) {
 	if (!set_node_type($dest, $DIR, $inpath)) {
@@ -628,7 +643,7 @@ sub add_input($;$) {
 	return;
     }
     # Successful!
-    $dest->{date} = max(node_date($dest), $st[9]);
+    $dest->{date} = $date;
 }
 
 #
@@ -1121,70 +1136,113 @@ sub emit_one_fat($) {
     return $bytes;
 }
 
-# Maximum chunk size for writezero() and emit_file()
-my $BUFSIZ = 1024*1024;
+my $zerobuf;
+sub emit_flush_file($) {
+    my($out) = @_;
+    my $zeroes = $out->{zeroes};
+
+    return unless ($zeroes);
+
+    my $fh     = $out->{fh};
+    my $sparse = $out->{sparse};
+    my $fpos   = $out->{fpos};
+
+    if ($sparse) {
+	my $minsparse = $sparse + npad($fpos, $sparse);
+	if ($zeroes >= $minsparse) {
+	    my $whereto = $fpos + $zeroes;
+	    $fh->flush;
+	    if (truncate($fh, $whereto) && seek($fh, $whereto, SEEK_SET)) {
+		$zeroes = 0;
+		$fpos = $whereto;
+	    } else {
+		# Sparsification failed
+		seek($fh, $fpos, SEEK_SET); # Try to undo
+		$out->{sparse} = 0;
+	    }
+	}
+    }
+    while ($zeroes > 0) {
+	my $chunk = min($zeroes, length($zerobuf));
+	print $fh substr($zerobuf, 0, $chunk);
+	$zeroes -= $chunk;
+	$fpos   += $chunk;
+    }
+
+    die if ($zeroes);
+    $out->{zeroes} = $zeroes;
+    $out->{fpos}   = $fpos;
+}
 
 sub emit_to_file($$) {
     my($out,$s) = @_;
-    my $flushing = !defined($s);
-    my $fh = $out->{fh};
+    my $fh       = $out->{fh};
 
-    $s =~ s/(\0+)$//;
-    my $zl = length($1);
-    if ($s ne '' || $flushing) {
-	if ($out->{sparse} && $out->{zeroes} >= $out->{sparse}) {
-	    my $whereto = tell($fh);
-	    if ($whereto >= 0) {
-		$fh->flush;
-		$whereto += $out->{zeroes};
-		if (truncate($fh,$whereto) && seek($fh,$whereto,0)) {
-		    die unless (tell($fh) == $whereto);
-		    $out->{zeroes} = 0;
-		}
+    while (length($s)) {
+	my $sparse   = $out->{sparse};
+	my $unsparse = $sparse-1;
+	my $ns;
+	my $zeroes   = $out->{zeroes};
+	my $dl;
+
+	if ($sparse) {
+	    $s =~ s/^((\0*)([^\0]+(?:\0{,$unsparse}[^\0]+)*)?)//o;
+	    my $zl = $zeroes + length($2);
+	    if (!length($3) || $zl >= $sparse) {
+		$out->{zeroes} = $zeroes = $zl;
+		$ns = $3;
+	    } else {
+		$ns = $1;
 	    }
+	} else {
+	    $ns = $s;
+	    undef $s;
 	}
-	while ($out->{zeroes} > 0) {
-	    my $chunk = min($out->{zeroes}, $BUFSIZ);
-	    print $fh "\0" x $chunk;
-	    $out->{zeroes} -= $chunk;
+
+	if (my $dl = length($ns)) {
+	    emit_flush_file($out) if ($zeroes);
+	    print $fh $ns;
+	    $out->{fpos} += $dl;
 	}
-	print $fh $s;
     }
-    $out->{zeroes} += $zl;
 }
-sub emit_to_hash($$;$) {
-    my($out,$s,$flush) = @_;
+sub emit_to_hash($$) {
+    my($out,$s) = @_;
     $out->{hash}->add($s);
 }
 
 sub emit($@) {
     my $out = shift(@_);
+    my $emitfunc = $out->{emitfunc};
     my $bytes = 0;
 
     foreach my $s (@_) {
-	next unless (defined($s));
-	$out->{emitfunc}->($out, $s);
 	my $len = length($s);
-	$bytes += $len;
-	$out->{bytes} += $len;
+	if ($len) {
+	    $emitfunc->($out, $s);
+	    $bytes += $len;
+	}
     }
+    $out->{bytes} += $bytes;
     return $bytes;
 }
 sub emit_flush($) {
     my($out) = @_;
-    $out->{emitfunc}->($out, undef);
+    my $flushfunc = $out->{flushfunc};
+    $flushfunc->($out) if ($flushfunc);
 }
 sub emit_zero($$) {
     my($out, $count) = @_;
 
-    if (defined($out->{zeroes})) {
+    if ($out->{sparse}) {
 	$out->{zeroes} += $count;
+	$out->{bytes}  += $count;
 	return $count;
     } else {
 	my $bytes = 0;
 	while ($count > $bytes) {
-	    my $chunk = min($count - $bytes, $BUFSIZ);
-	    $bytes += emit($out, "\0" x $chunk);
+	    my $chunk = min(length($zerobuf), $count - $bytes);
+	    $bytes += emit($out, substr($zerobuf, 0, $chunk));
 	}
 	return $bytes;
     }
@@ -1222,53 +1280,19 @@ sub dosdate {
 
     return [($lt[5] << 25) + ($lt[4] << 21) + ($lt[3] << 16) +
 	    ($lt[2] << 11) + ($lt[1] << 5) + ($lt[0] >> 1),
-	    ($lt[0] & 1) ? 100 : 0, $tz];
+	    ($lt[0] & 1) ? 100 : 0, $tz, $time];
 }
 
 sub dir_shortent($$$$$) {
     my($name, $attr, $date, $clustno, $size) = @_;
 
     $size = 0 if ($attr & ($DIR|$VOL));
-
-    my $datetime = $opt{date} || dosdate($date);
     return pack('A11CCCVvvVvV', $name, $attr, 0, 0,
-		$datetime->[0], $datetime->[0] >> 16, $clustno >> 16,
-		$datetime->[0], $clustno & 0xffff, $size);
+		$date->[0], $date->[0] >> 16, $clustno >> 16,
+		$date->[0], $clustno & 0xffff, $size);
 }
 
-sub dir_longent($$) {
-    my($longname, $shortent) = @_;
-
-    my $namesum = 0;
-    foreach my $nb (unpack('C11', $shortent)) {
-	$namesum = (($namesum & 1) << 7) + ($namesum >> 1) + $nb;
-	$namesum &= 0xff;
-    }
-
-    my $longpos = length($longname);
-    my $longpad = $longpos % 26;
-    if ($longpad) {
-	$longname .= "\0\0";
-	$longname .= "\xff" x (24 - $longpad);
-	$longpos  = length($longname);
-    }
-    my $longctr = ($longpos/26) | 0x40;
-    my $longent = '';
-    while ($longctr) {
-	$longpos -= 26;
-	$longent .= pack('Ca10CCCa12va4', $longctr,
-			 substr($longname, $longpos, 10),
-			 0x0f, 0, $namesum,
-			 substr($longname, $longpos+10, 12),
-			 0,
-			 substr($longname, $longpos+22, 4));
-	$longctr = ($longctr & 0x3f) - 1;
-    }
-
-    return $longent . $shortent;
-}
-
-sub exfat_csum($$) {
+sub fat_csum($$) {
     my($s,$bits) = @_;
     my $csum = 0;
     my $shift = $bits-1;
@@ -1279,20 +1303,37 @@ sub exfat_csum($$) {
     return $csum;
 }
 
-sub emit_direntry_fat($$) {
-    my($f, $parm) = @_;
+sub direntry_fat($$) {
+    my($f) = @_;
+    my $type = $f->{type};
+    return undef if ($type & $EXFAT);
 
-    next if ($f->{type} & $EXFAT);
-    my $attr = ($f->{type} & ($DIR|$VOL)) | $f->{flags};
-    my $ent = dir_shortent($f->{shortname}, $attr, node_date($f),
-			   $f->{clustno}, $f->{size});
-    $ent = dir_longent($f->{longname}, $ent);
+    my $attr     = ($type & ($DIR|$VOL)) | $f->{flags};
+    my $shortent = dir_shortent($f->{shortname}, $attr, $f->{date},
+				$f->{clustno}, $f->{size});
+    my $namesum = fat_csum(substr($shortent, 0, 11), 8);
 
-    return emit($parm->{out}, $ent);
+    my $longname = $f->{longname} . pack('v*', 0, (0xffff) x 11);
+    my $longpos = length($longname);
+    $longpos -= $longpos % 26;
+    my $longctr = ($longpos/26) | 0x40;
+    my $ent;
+    while ($longctr) {
+	$longpos -= 26;
+	$ent .= pack('Ca10CCCa12va4', $longctr,
+		     substr($longname, $longpos, 10),
+		     0x0f, 0, $namesum,
+		     substr($longname, $longpos+10, 12),
+		     0,
+		     substr($longname, $longpos+22, 4));
+	$longctr = ($longctr & 0x3f) - 1;
+    }
+    $ent .= $shortent;
+    return $ent;
 }
 
-sub emit_direntry_exfat($$) {
-    my($f, $parm) = @_;
+sub direntry_exfat($) {
+    my($f) = @_;
     my $ent;
     my $do_checksum = 1;
 
@@ -1304,7 +1345,7 @@ sub emit_direntry_exfat($$) {
 	    $ent .= pack('CC@20VQ<', $extype, 0, $f->{clustno}, $f->{size});
 	    $do_checksum = 0;
 	} elsif ($extype == $EXFAT_UPCASE) {
-	    $ent .= pack('C@4V@20VQ<', $extype, exfat_csum($f->{data},32),
+	    $ent .= pack('C@4V@20VQ<', $extype, fat_csum($f->{data},32),
 			 $f->{clustno}, $f->{size});
 	    $do_checksum = 0;
 	} else {
@@ -1330,7 +1371,7 @@ sub emit_direntry_exfat($$) {
 
 	$ent .= pack('CCCCvvQ<VVQ<',
 		     $EXFAT_STREAM, $allocflags, 0, length($longname) >> 1,
-		     exfat_csum(upcase_longname($longname),16), 0,
+		     fat_csum(upcase_longname($longname),16), 0,
 		     $size, 0, $f->{clustno}, $size);
 
 	for (my $p = 0; $p < length($longname); $p += 30) {
@@ -1338,45 +1379,36 @@ sub emit_direntry_exfat($$) {
 	}
     }
     substr($ent,2,0) = pack('v', exfat_csum($ent,16)) if ($do_checksum);
-
-    return emit($parm->{out}, $ent);
+    return $ent;
 }
 
 # Emit the contents of a directory
 sub emit_dir {
     my($dir, $parm) = @_;
-    my $de;
+    my $out = $parm->{out};
+    my $exfat = $parm->{exfat};
+    my $mkent = $exfat ? \&direntry_exfat : \&direntry_fat;
+    my $preent;
 
-    my $up = $dir->{up};
-    my $bytes = 0;
+    if (!$exfat && (my $up = $dir->{up})) {
+	# Not the root directory, emit . and ..
+	my $dirdate = $dir->{date};
+	$dir->{date} = node_date($dir) unless ($dirdate);
+	$preent = dir_shortent('.',  $DIR, $dirdate, $dir->{clustno}, 0);
 
-    if ($parm->{exfat}) {
-	foreach my $f (@{$dir->{filelist}}) {
-	    $bytes += emit_direntry_exfat($f, $parm);
-	}
-    } else {
-	# Special entries at the beginning
-	if (defined($up)) {
-	    # Not the root directory, emit . and ..
-	    my $dirdate = $dir->{date} = node_date($dir);
-
-	    $de  = dir_shortent('.',  $DIR, $dirdate, $dir->{clustno}, 0);
-
-	    # For some stupid reasons .. is supposed to have 0 in the cluster
-	    # pointer when it points to the root directory even on FAT32...
-	    my $upptr = defined($up->{up}) ? $up->{clustno} : 0;
-	    $de .= dir_shortent('..', $DIR, $dirdate, $upptr,  0);
-	    $bytes = emit($parm->{out}, $de);
-	}
-
-	# The regular directory entry list, already sorted
-	foreach my $f (@{$dir->{filelist}}) {
-	    $bytes += emit_direntry_fat($f, $parm);
-	}
+	# For some stupid reason .. is supposed to have 0 in the cluster
+	# pointer when it points to the root directory even on FAT32...
+	my $upptr = $up->{up} ? $up->{clustno} : 0;
+	$preent .= dir_shortent('..', $DIR, $dirdate, $upptr,  0);
     }
 
-    die if ($bytes != $dir->{size});
-    $bytes += emit_zero($parm->{out}, $dir->{paddedsize} - $bytes);
+    # The regular directory entry list, already sorted
+    my $bytes = emit($out, $preent, map { $mkent->($_) } @{$dir->{filelist}});
+
+    if ($bytes != $dir->{size}) {
+	die "$bytes != $dir->{size}, fh = $out->{fh}";
+    }
+    $bytes += emit_zero($out, $dir->{paddedsize} - $bytes);
     return $bytes;
 }
 
@@ -1384,8 +1416,9 @@ sub emit_dir {
 sub emit_file {
     my($f, $parm) = @_;
     my $bytes = 0;
+    my $size = $f->{size};
 
-    return if (!$f->{size});	# Empty file
+    return if (!$size);		# Empty file
 
     my $out = $parm->{out};
 
@@ -1394,28 +1427,27 @@ sub emit_file {
     } elsif (defined($f->{data})) {
 	$bytes = emit($out, $f->{data});
     } elsif (defined($f->{inpath})) {
-	my $sizeleft = $f->{size};
 	my $in;
 	if (open($in, '<', $f->{inpath})) {
 	    binmode($in);
-	    while ($sizeleft) {
+	    while ($bytes < $size) {
 		my $buf;
-		my $chunk = read($in, $buf, min($BUFSIZ, $sizeleft));
-		last if (!$chunk);
+		my $chunk = min($size - $bytes, $out->{iosize});
+		last if (!read($in, $buf, $chunk));
 		$bytes += emit($out, $buf);
-		$sizeleft -= $chunk;
 	    }
 	    close($in);
 	}
-	if ($sizeleft) {
+	if ($bytes < $size) {
 	    print STDERR "%s: %s: %s\n", $opt{outfile}, $f->{inpath}, $!;
 	    $err++;
+	    $size = $bytes;	# Avoid redundant error messages
 	}
     }
 
-    if ($bytes > $f->{size}) {
-	print STDERR "%s: %s: output size overflow\n",
-	    $opt{outfile}, $opt{path};
+    if ($bytes != $size) {
+	print STDERR "%s: %s: file size changed during processing\n",
+	    $opt{outfile}, $f->{path};
 	$err++;
     }
     $bytes += emit_zero($out, $f->{paddedsize} - $bytes);
@@ -1655,7 +1687,7 @@ sub emit_image($$) {
     my $parm = $root->{parm};
     my $disk = $parm->{disk};
 
-    $out->{bytes} = 0;
+    $zerobuf = pack('.', $out->{iosize});
     $parm->{out}  = $out;
 
     # Create the partition table
@@ -1675,6 +1707,8 @@ sub emit_image($$) {
     $bytes += emit_zero($out,
 			($disk->{startsec} << $parm->{secshift}) - $bytes);
 
+    die unless ($bytes == ($disk->{startsec} << $parm->{secshift}));
+
     # The boot sector/superblock
     $bytes += emit_superblock($root, $parm);
 
@@ -1684,13 +1718,15 @@ sub emit_image($$) {
     }
 
     # Special entries, root directory, subdirectories, files
-    $bytes += populate_with($root, $parm, $EXFAT, \&emit_file);
+    if ($parm->{exfat}) {
+	$bytes += populate_with($root, $parm, $EXFAT, \&emit_file);
+    }
     $bytes += emit_dir($root, $parm);
     $bytes += populate_with($root, $parm, $DIR,   \&emit_dir);
     $bytes += populate_with($root, $parm, $FILE,  \&emit_file);
 
     # Finally, pad the image and output the backup GPT if there is one
-    # This does not need to be included in the final hash, so...
+    # This does not need to be included when hashing, so...
     if ($opt{pad} && $out->{fh}) {
 	$bytes += emit_zero($out,
 			    ($disk->{endsec} << $parm->{secshift}) - $bytes);
@@ -2040,7 +2076,8 @@ if (!$opt{random}) {
     $opt{print_offset} = 0;
     $pseudo_random_buf = "\xee" x 48;
     set_identifiers($root);
-    my %ho = ('hash' => Digest::SHA->new(384), 'emitfunc' => \&emit_to_hash);
+    my %ho = ('hash' => Digest::SHA->new(384), 'iosize' => $default_iosize,
+	      'bytes' => 0, 'zeroes' => 0, 'emitfunc' => \&emit_to_hash);
     emit_image($root, \%ho);
 
     %opt = %optsave;
@@ -2049,7 +2086,8 @@ if (!$opt{random}) {
 
 set_identifiers($root);	# Update identifiers
 
-my %oo = ('emitfunc' => \&emit_to_file);
+my %oo = ('bytes' => 0, 'zeroes' => 0,
+	  'emitfunc' => \&emit_to_file, 'flushfunc' => \&emit_flush_file);
 END {
     if (defined($oo{filename}) && $oo{fh}) {
 	close($oo{fh});
@@ -2064,10 +2102,14 @@ if ($opt{outfile} eq '-') {
     open($oo{fh}, '>', $oo{filename}) or die "$opt{outfile}: $!\n";
 }
 my @ost = stat($oo{fh});
-if ($opt{sparse} && S_ISREG($ost[2]) && $ost[11]) {
-    $oo{sparse} = max($opt{sparse}, $ost[11]);
-    $oo{zeroes} = 0;
+$oo{sparse} = max($opt{sparse}, $ost[11]);
+if ($oo{sparse}) {
+    $oo{sparse} = 0
+	if (!S_ISREG($ost[2]) || !eval { truncate($oo{fh},0) } ||
+	    !seek($oo{fh},0,SEEK_SET) || tell($oo{fh}) != 0);
 }
+
+$oo{iosize} = max($ost[11], $oo{sparse}, $default_iosize);
 emit_image($root, \%oo);
 
 if (defined($oo{filename})) {

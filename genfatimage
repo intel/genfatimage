@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -T
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright 2025 Intel Corporation - All Rights Reserved
 
@@ -15,7 +15,6 @@ use Digest::SHA;
 use Encode;
 use Fcntl qw(:DEFAULT :mode :seek);
 use File::Spec;
-use POSIX;
 
 die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
 
@@ -265,6 +264,11 @@ sub npad($$) {
     $r += $b if ($r < 0);
     return $r;
 }
+# Untaint a scalar value as long as they are *already* a nonnegative integers
+sub untaint_uint($) {
+    die unless ($_[0] =~ /^(\d+)$/);
+    return $1 + 0;
+}
 
 # Code to kill a BIOS boot: 1: int $0x80; hlt; jmp 1b
 my $KILLBOOT = "\xcd\x18\xf4\xeb\xfb";
@@ -431,12 +435,22 @@ sub pathlist($;$) {
 # Error counter
 my $err = 0;
 
-# Directory entry types, and lists of nodes of each type
-# Important: 0 < $EXFAT < $VOL < $DIR < $FILE
-my $EXFAT   = 0x04;		# exFAT special entry
-my $VOL     = 0x08;		# Volume label
-my $DIR     = 0x10;
-my $FILE    = 0x20;		# Abusing the ARCHIVE bit
+# Directory entry types and flags, and lists of nodes of each type
+# Note that file attributes are stored in {attr}, and so don't directly
+# conflict with types.
+my $EXFAT    = 0x01;		# Type: exFAT special entry
+my $READONLY = 0x01;		# File attribute
+my $HIDDEN   = 0x02;		# File attribute
+my $SYSTEM   = 0x04;		# File attribute
+my $VOL      = 0x08;		# Type: volume label
+my $LONGNAME = 0x0f;		# FAT long filename directory entry
+my $DIR      = 0x10;		# Type: directory
+my $ARCHIVE  = 0x20;		# File attribute
+my $ATTRMASK = 0x3f;		# The only bits valid in a directory entry
+my $FILE     = 0x40;		# Type: file
+
+my %typename = ($FILE => 'file', $DIR => 'directory', $VOL => 'volume',
+		$EXFAT => 'special', 0 => 'unknown');
 
 # exFAT directory entry types
 my $EXFAT_BITMAP = 0x81;
@@ -459,7 +473,7 @@ sub normalize_filename($) {
     $nn =~ s/^(\s)/_$1/;
     $nn =~ s/([\.\s])$/$1_/;
     if ($opt{strict}->{filename} && $nn ne $vn) {
-	print STDERR "$opt{outfile}: invalid FAT filename: \"$vn\"\n";
+	print STDERR "$opt{outfile}: invalid (ex)FAT filename: \"$vn\"\n";
 	$err++;
     }
     return $nn;
@@ -469,13 +483,15 @@ sub set_node_type($$;$) {
     my($node, $type, $inpath) = @_;
     if ($node->{type}) {
 	if ($node->{type} != $type) {
-	    printf STDERR "%s: type conflict: %s (%s and %s)\n",
-		$opt{outfile}, $node->{type} eq $DIR ? ' and directory' : '',
-		$node->{path}, $node->{inpath}, $inpath;
+	    printf STDERR "%s: %s: type conflict: %s and %s\n",
+		$opt{outfile}, $node->{path},
+		$typename{$node->{type}}, $typename{$type};
+	    $err++;
 	    return 0;
 	}
     } else {
 	$node->{type} = $type;
+	$node->{attr} |= $type & ($DIR|$VOL);
 	push(@{$node->{root}->{nodes}->{$type}}, $node);
 	$node->{files} = {} if ($type == $DIR);
     }
@@ -491,11 +507,7 @@ sub mktreenode($@) {
     foreach my $p (@path) {
 	my $herepath = $here->{path};
 
-	if (!set_node_type($here, $DIR)) {
-	    print STDERR "$opt{outfile}: type conflict: $herepath\n";
-	    $err++;
-	    return undef;
-	}
+	return undef unless (set_node_type($here, $DIR));
 
 	my $f = normalize_filename($p);
 	my $longname = genlongname($f);
@@ -635,9 +647,9 @@ sub add_input($;$) {
 	    }
 	}
 	# Readonly and archive bits
-	$dest->{flags} = 0x00;
-	$dest->{flags} |= 0x01 if (!($mode & S_IWRITE) || $opt{readonly});
-	$dest->{flags} |= 0x20 if ($opt{archive});
+	my $ro = defined($opt{readonly}) ? $opt{readonly} : !($mode & S_IWRITE);
+	$dest->{attr} |= $READONLY if ($ro);
+	$dest->{attr} |= $ARCHIVE  if ($opt{archive});
     } else {
 	printf STDERR "$opt{outfile}: warning: skipping non-regular file: $inpath\n";
 	return;
@@ -1152,7 +1164,10 @@ sub emit_flush_file($) {
 	if ($zeroes >= $minsparse) {
 	    my $whereto = $fpos + $zeroes;
 	    $fh->flush;
-	    if (truncate($fh, $whereto) && seek($fh, $whereto, SEEK_SET)) {
+	    my $here = tell($fh);
+	    my $whereto = $here + $zeroes;
+	    if ($here == $fpos && truncate($fh, $whereto) &&
+		seek($fh, $whereto, SEEK_SET)) {
 		$zeroes = 0;
 		$fpos = $whereto;
 	    } else {
@@ -1170,7 +1185,7 @@ sub emit_flush_file($) {
     }
 
     die if ($zeroes);
-    $out->{zeroes} = $zeroes;
+    $out->{zeroes} = 0;
     $out->{fpos}   = $fpos;
 }
 
@@ -1230,11 +1245,13 @@ sub emit_flush($) {
     my($out) = @_;
     my $flushfunc = $out->{flushfunc};
     $flushfunc->($out) if ($flushfunc);
+    $out->{fh}->flush if ($out->{fh});
 }
 sub emit_zero($$) {
     my($out, $count) = @_;
 
     if ($out->{sparse}) {
+	$count = untaint_uint($count);
 	$out->{zeroes} += $count;
 	$out->{bytes}  += $count;
 	return $count;
@@ -1308,8 +1325,7 @@ sub direntry_fat($$) {
     my $type = $f->{type};
     return undef if ($type & $EXFAT);
 
-    my $attr     = ($type & ($DIR|$VOL)) | $f->{flags};
-    my $shortent = dir_shortent($f->{shortname}, $attr, $f->{date},
+    my $shortent = dir_shortent($f->{shortname}, $f->{attr}, $f->{date},
 				$f->{clustno}, $f->{size});
     my $namesum = fat_csum(substr($shortent, 0, 11), 8);
 
@@ -1322,7 +1338,7 @@ sub direntry_fat($$) {
 	$longpos -= 26;
 	$ent .= pack('Ca10CCCa12va4', $longctr,
 		     substr($longname, $longpos, 10),
-		     0x0f, 0, $namesum,
+		     $LONGNAME, 0, $namesum,
 		     substr($longname, $longpos+10, 12),
 		     0,
 		     substr($longname, $longpos+22, 4));
@@ -1363,9 +1379,8 @@ sub direntry_exfat($) {
 	my $size = ($f->{type} & $DIR) ? $f->{paddedsize} : $f->{size};
 	$ent = pack('CCvvV3C5a7',
 		    $EXFAT_FILE, div_up(length($longname), 30)+1,
-		    ($f->{type} & $DIR)|$f->{flags}, 0,
-		    ($datetime->[0]) x 3, ($datetime->[1]) x 2,
-		    ($datetime->[2]) x 3, '');
+		    $f->{attr}, 0, ($datetime->[0]) x 3,
+		    ($datetime->[1]) x 2, ($datetime->[2]) x 3, '');
 
 	my $allocflags = $f->{size} ? ($f->{fatchain} ? 0x01 : 0x03) : 0x00;
 
@@ -1546,7 +1561,7 @@ sub create_vol_label($) {
     $vol = 'EFI BOOT' if ($vol eq '' && $opt{efi});
     $vol = decode_utf8($vol);
     # Per Microsoft: volumne names are 11 characters max even in Unicode
-    my $longname = substr(to_utf($vol), 0, 22);
+    my $longname = substr(to_uni($vol), 0, 11 << 1);
     $root->{vollbl} = {	'name' => $vol, 'longname' => $longname,
 			'path' => '<vol>', 'up' => $root, 'root' => $root };
     if ($vol ne '') {
@@ -1744,7 +1759,7 @@ sub usage(;$) {
     my $out = $err ? \*STDERR : \*STDOUT;
     print $out <<EOF;
 $myname $myversion
-Usage: $myname [options] [-o] outfile [[[destination]:]:]input_path...
+Usage: $myname [options] -o outfile [--] [[[destination]:]:]input_path...
 
 Create and populate a FAT filesystem image. By default it tries to
 minimize the image as much as possible, leaving no free space and
@@ -1773,18 +1788,20 @@ as the destination name.
 Most options can be negated by prefixing their long forms with --no-.
 
 Options:
--o, --output             Specify the output file (- for standard output)
+-o, --output             Specify the output file - REQUIRED (use - for stdout)
     --flat, --floppy     Do not create a partition table
     --part               Create a partion table, either MBR or GPT [default]
     --mbr                Create an MBR partition table
     --gpt[=<partitions>] Create a GPT partition table [default with --efi]
 -e ,--efi, --uefi        Mark the partition as an EFI system partition
 -b, --boot, --active     Mark the partition as legacy BIOS bootable
--L, --label=<name>       Set the filesystem volume name
+-L, --label=<name>       Set the filesystem volume and GPT partition name
 -H, --heads=#            Define heads per cylinder for legacy geometry [255]
 -S, --secpertrack=#      Define sectors per track legacy geometry [63]
--v, --verbose[=#]        Set message verbosity
+-v, --verbose[=#]        Set message verbosity [0]
+-q, --quiet              Suppress all messages except fatal errors
 -r, --readonly           Set the readonly flag on every file
+-w, --writable           Never set the readonly flag (alias for --no-readonly)
     --archive            Set the archive flag on every file
 -R, --reserve=<files>,<bytes>,<rootfiles>,<namelen>
                          Specify additional space to reserve in the filesystem
@@ -1885,9 +1902,8 @@ sub do_options($@) {
 	my $os = $optn;
 	my $truth = ($os !~ s/^-no-?([^=]+)$/-$1/);
 
-	if ($os =~ /^(?:o|-output)$/) {
-	    $opt{outfile} = $truth
-		? get_arg($args, $os) : File::Spec->devnull();
+	if ($os =~ /^(?:o|-output)(?:=.*)?$/) {
+	    $opt{outfile} = get_arg($args, $os, $truth);
 	} elsif ($os =~ /^(?:e|-efi|-uefi)$/) {
 	    $opt{efi} = $truth;
 	} elsif ($os =~ /^(?:g|-gpt)(=(\d+))$/) {
@@ -1919,8 +1935,8 @@ sub do_options($@) {
 	    }
 	} elsif ($os =~ /^(?:R|-reserve)(?:=.*)?$/) {
 	    $opt{reserve} = get_arg_uints($args,$os,$truth,4);
-	} elsif ($os =~ /^(?:r|-readonly)?$/) {
-	    $opt{readonly} = $truth;
+	} elsif ($os =~ /^(?:(r|-read-?only)|w|-writable|-read-?write)$/) {
+	    $opt{readonly} = ($1 ne '') ? $truth : !$truth;
 	} elsif ($os =~ /^(?:-archive)?$/) {
 	    $opt{archive} = $truth;
 	} elsif ($os =~ /^(?:-random)$/) {
@@ -1976,7 +1992,7 @@ sub do_options($@) {
 	    $opt{date} = get_arg($args,$os,$truth);
 	} elsif ($os =~ /^(?:U|-utc|-gmt)$/) {
 	    $opt{utc} = $truth;
-	} elsif ($os =~ /^-print-offset$/) {
+	} elsif ($os =~ /^-print-?offset$/) {
 	    $opt{print_offset} = $truth;
 	} elsif ($os =~ /^-sparse(?:=.*)?$/) {
 	    if ($truth) {
@@ -1999,20 +2015,21 @@ sub do_options($@) {
 sub parse_options(@_) {
     my(@args) = @_;
     my $output;
+    my @inputs;
 
-    while (defined(my $arg = $args[0])) {
-	last if ($arg !~ /^-((-?).*)$/);
-	shift(@args);
-	if ($2) {
-	    last if ($1 eq '-');
-	    do_options(\@args, $1);
+    while (defined(my $arg = shift(@args))) {
+	if ($arg !~ /^(?:(--?)|-(-.+)|-([^-].*))$/) {
+	    push(@inputs, $arg);		# Input filename
+	} elsif ($1) {
+	    push(@inputs, @args);		# End of options
+	    last;
+	} elsif ($2) {
+	    do_options(\@args, $2);		# Long option
 	} else {
-	    do_options(\@args, split(//, $1));
+	    do_options(\@args, split(//, $3));	# Short option(s)
 	}
     }
-    $opt{outfile} = shift(@args) unless (defined($opt{outfile}));
-
-    return @args;		# Input files
+    return @inputs;
 }
 
 sub parse_tz($) {
@@ -2043,6 +2060,11 @@ sub mystr2time($$) {
 }
 
 my(@inputs) = parse_options(@ARGV);
+if ($opt{outfile} =~ /^(.+)$/) {
+    $opt{outfile} = $1; # Untaint output filename
+} else {
+    die "$myname: no output file (see --help for usage)\n";
+}
 if (!@inputs) {
     die "$myname: no input files (see --help for usage)\n";
 }
@@ -2074,7 +2096,7 @@ create_layout($root);
 
 if (!$opt{random}) {
     my %optsave = %opt;
-    $opt{verbose} = 0;
+    $opt{verbose} = -1;
     $opt{print_offset} = 0;
     $pseudo_random_buf = "\xee" x 48;
     set_identifiers($root);

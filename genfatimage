@@ -16,13 +16,15 @@ use Encode;
 use Fcntl qw(:DEFAULT :mode :seek);
 use File::Spec;
 
-die "$0 a 64-bit integer Perl interpreter is required\n" unless (1 << 63);
-
 # Program name and version
 my $myname		= 'genfatimage';
 my $myversion		= '0.10';
 my $mycreator		= 'GenFatIm';
 my $default_iosize	= 64 << 10;
+
+unless (1 << 31 << 31) {
+    die "$0: a 64-bit integer Perl interpreter is required\n";
+}
 
 # Options structure
 my %opt = (

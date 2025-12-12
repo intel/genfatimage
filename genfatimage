@@ -1545,7 +1545,9 @@ sub create_vol_label($) {
     my $vol = $opt{volname};
     $vol = 'EFI BOOT' if ($vol eq '' && $opt{efi});
     $vol = decode_utf8($vol);
-    $root->{vollbl} = {	'name' => $vol, 'longname' => genlongname($vol),
+    # Per Microsoft: volumne names are 11 characters max even in Unicode
+    my $longname = substr(to_utf($vol), 0, 22);
+    $root->{vollbl} = {	'name' => $vol, 'longname' => $longname,
 			'path' => '<vol>', 'up' => $root, 'root' => $root };
     if ($vol ne '') {
 	set_node_type($root->{files}->{"\0\0vol"} = $root->{vollbl}, $VOL);

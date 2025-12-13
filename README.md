@@ -21,6 +21,9 @@ indirect
 
 As it is written in Perl, it *should* work on just about any platform.
 
+It currently requires a Perl interpreter compiled with 64-bit integer
+support. This is usually the norm these days, even on 32-bit platforms.
+
 As written, it is set up to use the `-T` (taint) option to Perl for
 additional security and robustness. If you are on a platform where you
 have to explicitly run the Perl interpreter, Perl requires the `-T`

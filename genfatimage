@@ -267,9 +267,11 @@ sub npad($$) {
     $r += $b if ($r < 0);
     return $r;
 }
-# Untaint a scalar value as long as they are *already* a nonnegative integers
+# Untaint a scalar value as long as it is *already* a valid nonnegative integer
 sub untaint_uint($) {
-    die unless ($_[0] =~ /^(\d+)$/);
+    my($n) = @_;
+    my $m = $n + 0;
+    die if ($m < 0 || $n ne $m || $n !~ /^([0-9]{1,20})$/a);
     return $1 + 0;
 }
 

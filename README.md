@@ -21,6 +21,13 @@ indirect
 
 As it is written in Perl, it *should* work on just about any platform.
 
+As written, it is set up to use the `-T` (taint) option to Perl for
+additional security and robustness. If you are on a platform where you
+have to explicitly run the Perl interpreter, Perl requires the `-T`
+option to be specified on the command line as well:
+`perl -T genfatimage ...`. If you don't want that, you can remove the `-T`
+option on the first line of the script.
+
 Usage
 -----
 
@@ -51,7 +58,7 @@ Usage documentation is provided by running `genfatimage --help`:
 
 ```
 genfatimage 0.10
-Usage: genfatimage [options] [-o] outfile [[[destination]:]:]input_path...
+Usage: genfatimage [options] -o outfile [--] [[[destination]:]:]input_path...
 
 Create and populate a FAT filesystem image. By default it tries to
 minimize the image as much as possible, leaving no free space and
@@ -80,18 +87,20 @@ as the destination name.
 Most options can be negated by prefixing their long forms with --no-.
 
 Options:
--o, --output             Specify the output file (- for standard output)
+-o, --output             Specify the output file - REQUIRED (use - for stdout)
     --flat, --floppy     Do not create a partition table
     --part               Create a partion table, either MBR or GPT [default]
     --mbr                Create an MBR partition table
     --gpt[=<partitions>] Create a GPT partition table [default with --efi]
 -e ,--efi, --uefi        Mark the partition as an EFI system partition
 -b, --boot, --active     Mark the partition as legacy BIOS bootable
--L, --label=<name>       Set the filesystem volume name
+-L, --label=<name>       Set the filesystem volume and GPT partition name
 -H, --heads=#            Define heads per cylinder for legacy geometry [255]
 -S, --secpertrack=#      Define sectors per track legacy geometry [63]
--v, --verbose[=#]        Set message verbosity
+-v, --verbose[=#]        Set message verbosity [0]
+-q, --quiet              Suppress all messages except fatal errors
 -r, --readonly           Set the readonly flag on every file
+-w, --writable           Never set the readonly flag (alias for --no-readonly)
     --archive            Set the archive flag on every file
 -R, --reserve=<files>,<bytes>,<rootfiles>,<namelen>
                          Specify additional space to reserve in the filesystem
@@ -115,7 +124,9 @@ Options:
 -U, --utc                Create time stamps in UTC, not local time
 -D, --date=<date>        Force the time stamp of all files to <date>
 -C, --creator=<name>     Set the filesystem creator name to <name> [GenFatIm]
+    --sparse[=<chunk>]   Try to create a sparse output file (default)
     --print-offset       Print filesystem offset in the image after completion
+    --keep               Do not delete the output file even if an error occurs
 -V, --version            Display the version information
 -h, --help               Display this help text
 ```

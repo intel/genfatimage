@@ -2045,7 +2045,7 @@ sub do_options($@) {
     }
 }
 
-sub parse_options(@_) {
+sub parse_options(@) {
     my(@args) = @_;
     my $output;
     my @inputs;

@@ -21,6 +21,7 @@ my $myname		= 'genfatimage';
 my $myversion		= '0.10';
 my $mycreator		= 'GenFatIm';
 my $default_iosize	= 64 << 10;
+my $max_iosize          = 2 << 20;
 
 unless (1 << 31 << 31) {
     die "$0: a 64-bit integer Perl interpreter is required\n";
@@ -1170,6 +1171,10 @@ sub emit_flush_file($) {
 	    my $whereto = $here + $zeroes;
 	    if ($here == $fpos && truncate($fh, $whereto) &&
 		seek($fh, $whereto, SEEK_SET)) {
+		if ($opt{verbose} >= 4) {
+		    printf STDERR "%s: skipped %d (0x%x) bytes from %d (0x%x) to %d (0x%x)\n",
+			$opt{outfile}, $zeroes, $zeroes, $here, $here, $whereto, $whereto;
+		}
 		$zeroes = 0;
 		$fpos = $whereto;
 	    } else {
@@ -1191,19 +1196,41 @@ sub emit_flush_file($) {
     $out->{fpos}   = $fpos;
 }
 
+my $sparse_regex;
+sub set_sparse($$) {
+    my($out,$sparse) = @_;
+    # Perl has a built-in limit on the length of a regex range,
+    # but it isn't easily discoverable. Use a string eval (*not*
+    # a block eval!) to trap the error and reduce the value if
+    # necessary. On most versions of Perl this is a number of the
+    # form 2^n - 2, so easy to check that way.
+    #
+    # The purpose of the regular expression is to optimize the handling
+    # of strings with runs of zeroes smaller than the sparse limit;
+    # making the threshold smaller just means some minor additional
+    # processing time.
+    for (my $resparse = $sparse; $resparse > 1; $resparse >>= 1) {
+	my $unsparse = ($resparse-1) & ~1;
+	my $re = eval 'qr/^((\0*)([^\0]+(?:\0{,'.$unsparse.'}[^\0]+)*)?)(.*)$/s';
+	if ($re) {
+	    $out->{sparse_regex} = $re;
+	    return $out->{sparse} = $sparse;
+	}
+    }
+    return $out->{sparse} = 0;
+}
+
 sub emit_to_file($$) {
     my($out,$s) = @_;
     my $fh       = $out->{fh};
 
     while (length($s)) {
 	my $sparse   = $out->{sparse};
-	my $unsparse = $sparse-1;
-	my $ns;
 	my $zeroes   = $out->{zeroes};
-	my $dl;
+	my $ns;
 
-	if ($sparse) {
-	    $s =~ s/^((\0*)([^\0]+(?:\0{,$unsparse}[^\0]+)*)?)//o;
+	if ($sparse && $s =~ $out->{sparse_regex}) {
+	    $s = $4;
 	    my $zl = $zeroes + length($2);
 	    if (!length($3) || $zl >= $sparse) {
 		$out->{zeroes} = $zeroes = $zl;
@@ -1247,7 +1274,6 @@ sub emit_flush($) {
     my($out) = @_;
     my $flushfunc = $out->{flushfunc};
     $flushfunc->($out) if ($flushfunc);
-    $out->{fh}->flush if ($out->{fh});
 }
 sub emit_zero($$) {
     my($out, $count) = @_;
@@ -1829,6 +1855,7 @@ Options:
 -C, --creator=<name>     Set the filesystem creator name to <name> [$mycreator]
     --sparse[=<chunk>]   Try to create a sparse output file (default)
     --print-offset       Print filesystem offset in the image after completion
+    --keep               Do not delete the output file even if an error occurs
 -V, --version            Display the version information
 -h, --help               Display this help text
 EOF
@@ -1973,6 +2000,8 @@ sub do_options($@) {
 	    }
 	} elsif ($os =~ /^(?:a|-align)$/) {
 	    $opt{align} = $truth;
+	} elsif ($os =~ /^(?:-keep)$/) {
+	    $opt{keep} = $truth;
 	} elsif ($os eq '-pad') {
 	    $opt{pad} = $truth;
 	} elsif ($os =~ /^(?:([Xx])|-exfat)(?:=(.*))?$/) {
@@ -2031,6 +2060,8 @@ sub parse_options(@_) {
 	    do_options(\@args, split(//, $3));	# Short option(s)
 	}
     }
+
+    postprocess_options();
     return @inputs;
 }
 
@@ -2061,7 +2092,73 @@ sub mystr2time($$) {
     return ($time, $tz);
 }
 
+# Postprocessing of some options
+sub postprocess_options() {
+    if ($opt{media}) {
+	my @sopt = qw(volsize upcase fats mbrspace bootspace rootdir gptsize);
+	foreach my $so (@sopt) {
+	    $opt{strict}->{$so} = 1 unless (defined($opt{strict}->{$so}));
+	}
+	$opt{align} = 1 unless (defined($opt{align}));
+    }
+    unless (defined($opt{creator})) {
+	$opt{creator} = $opt{strict}->{creator} ? 'WINNT4.1' : $mycreator;
+    }
+    if ($opt{date} eq '') {
+	undef $opt{date};
+    } else {
+	$opt{date} = dosdate(mystr2time($opt{date}, $opt{utc}));
+    }
+    if ($opt{efi} && $opt{exfat} && $opt{verbose} >= 0) {
+	print STDERR "$opt{outfile}: WARNING: EFI and exFAT are not compatible\n";
+    }
+}
+
+# Generate the image and emit it to the actual output file
+sub emit_image_to_file($$) {
+    my($root, $outfile) = @_;
+
+    my %oo = ('bytes' => 0, 'zeroes' => 0,
+	      'emitfunc' => \&emit_to_file, 'flushfunc' => \&emit_flush_file);
+    END {
+	if (defined($oo{filename}) && $oo{fh}) {
+	    close($oo{fh});
+	    unlink($oo{filename}) unless ($opt{keep});
+	}
+    }
+
+    if ($outfile eq '-') {
+	$oo{fh} = \*STDOUT;
+    } else {
+	open($oo{fh}, '>', $oo{filename} = $outfile) or die "$outfile: $!\n";
+    }
+    binmode($oo{fh});
+
+    my @ost = stat($oo{fh});
+    # This strange expression tries to figure out if sparsifying the output
+    # is possible and safe. truncate() is inside eval {} since it will
+    # raise an exception if truncate() is not implemented on a specific OS.
+    my $blocksize = min($ost[11], $max_iosize);
+    set_sparse(\%oo, $opt{sparse} && S_ISREG($ost[2]) &&
+	       eval { truncate($oo{fh}, 0) } && seek($oo{fh},0,SEEK_SET) &&
+	       tell($oo{fh}) == 0 ? max($opt{sparse}, $blocksize) : 0);
+
+    $oo{iosize} = max($blocksize, $default_iosize);
+    emit_image($root, \%oo);
+
+    $oo{fh}->flush;
+
+    if (defined($oo{filename})) {
+	close($oo{fh});
+	undef($oo{filename});	# Successful! Don't delete the output
+    }
+}
+
+# Hopefully correct...?!
+binmode(STDERR, ':encoding(UTF-8)');
+
 my(@inputs) = parse_options(@ARGV);
+
 if ($opt{outfile} =~ /^(.+)$/) {
     $opt{outfile} = $1; # Untaint output filename
 } else {
@@ -2069,24 +2166,6 @@ if ($opt{outfile} =~ /^(.+)$/) {
 }
 if (!@inputs) {
     die "$myname: no input files (see --help for usage)\n";
-}
-
-# Hopefully correct...?!
-binmode(STDERR, ':encoding(UTF-8)');
-
-# Postprocessing of some options
-unless (defined($opt{creator})) {
-    $opt{creator} = $opt{strict}->{creator} ? 'WINNT4.1' : $mycreator;
-}
-if ($opt{media}) {
-    map { $opt{strict}->{$_} = 1 unless (defined($opt{strict}->{$_})) }
-	qw(volsize upcase fats mbrspace bootspace rootdir gptsize);
-    $opt{align}  = 1 unless (defined($opt{align}));
-}
-$opt{date} = dosdate(mystr2time($opt{date}, $opt{utc})) if ($opt{date} ne '');
-
-if ($opt{efi} && $opt{exfat} && $opt{verbose} >= 0) {
-    print STDERR "$opt{outfile}: WARNING: EFI and exFAT are not compatible\n";
 }
 
 my $root = read_inputs(@inputs);
@@ -2111,36 +2190,6 @@ if (!$opt{random}) {
 }
 
 set_identifiers($root);	# Update identifiers
-
-my %oo = ('bytes' => 0, 'zeroes' => 0,
-	  'emitfunc' => \&emit_to_file, 'flushfunc' => \&emit_flush_file);
-END {
-    if (defined($oo{filename}) && $oo{fh}) {
-	close($oo{fh});
-	unlink($oo{filename});
-    }
-}
-
-if ($opt{outfile} eq '-') {
-    $oo{fh} = \*STDOUT;
-} else {
-    $oo{filename} = $opt{outfile};
-    open($oo{fh}, '>', $oo{filename}) or die "$opt{outfile}: $!\n";
-}
-my @ost = stat($oo{fh});
-$oo{sparse} = max($opt{sparse}, $ost[11]);
-if ($oo{sparse}) {
-    $oo{sparse} = 0
-	if (!S_ISREG($ost[2]) || !eval { truncate($oo{fh},0) } ||
-	    !seek($oo{fh},0,SEEK_SET) || tell($oo{fh}) != 0);
-}
-
-$oo{iosize} = max($ost[11], $oo{sparse}, $default_iosize);
-emit_image($root, \%oo);
-
-if (defined($oo{filename})) {
-    close($oo{fh});
-    undef($oo{filename});	# Don't delete
-}
+emit_image_to_file($root, $opt{outfile});
 
 exit(0);

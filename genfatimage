@@ -1153,6 +1153,14 @@ sub emit_one_fat($) {
     return $bytes;
 }
 
+# Flush a file handle and die on errors
+sub fh_flush($) {
+    my($fh) = @_;
+    if ($fh->error || !$fh->flush || $fh->error) {
+	die "$opt{filename}: output write error: $!\n";
+    }
+}
+
 my $zerobuf;
 sub emit_flush_file($) {
     my($out) = @_;
@@ -1168,7 +1176,7 @@ sub emit_flush_file($) {
 	my $minsparse = $sparse + npad($fpos, $sparse);
 	if ($zeroes >= $minsparse) {
 	    my $whereto = $fpos + $zeroes;
-	    $fh->flush;
+	    fh_flush($fh);
 	    my $here = tell($fh);
 	    my $whereto = $here + $zeroes;
 	    if ($here == $fpos && truncate($fh, $whereto) &&
@@ -2148,7 +2156,7 @@ sub emit_image_to_file($$) {
     $oo{iosize} = max($blocksize, $default_iosize);
     emit_image($root, \%oo);
 
-    $oo{fh}->flush;
+    fh_flush($oo{fh});
 
     if (defined($oo{filename})) {
 	close($oo{fh});

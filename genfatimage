@@ -51,7 +51,8 @@ my %strict_help = (
     'gptsize'   => 'Size GPT to a minimum of 128 partition entries (GPT)',
     'creator'   => 'Set default system name to "WINNT4.1" (not exFAT)',
     'flags'     => 'Error out on unknown --strict flags',
-    'filename'  => 'Error out on invalid filenames'
+    'filename'  => 'Error out on invalid filenames',
+    'pmbr'      => 'Do not include BIOS boot code or disk ID in the PMBR (GPT)'
 );
 
 # Constants for partition types; the ordering matters for command-line parsing!
@@ -351,16 +352,91 @@ sub to_chs($$) {
 # Create a minimal MBR partition table with one single partition.
 sub gen_mbr($$$;$$$)
 {
+    # MBR boot code, from the Syslinux distribution version 6.04-pre1.
+    #
+    #   Copyright 2007-2009 H. Peter Anvin - All Rights Reserved
+    #   Copyright 2009-2010 Intel Corporation; author: H. Peter Anvin
+    #
+    #   Permission is hereby granted, free of charge, to any person
+    #   obtaining a copy of this software and associated documentation
+    #   files (the "Software"), to deal in the Software without
+    #   restriction, including without limitation the rights to use,
+    #   copy, modify, merge, publish, distribute, sublicense, and/or
+    #   sell copies of the Software, and to permit persons to whom
+    #   the Software is furnished to do so, subject to the following
+    #   conditions:
+    #
+    #   The above copyright notice and this permission notice shall
+    #   be included in all copies or substantial portions of the Software.
+    #
+    #   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    #   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+    #   OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+    #   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+    #   HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+    #   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    #   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+    #   OTHER DEALINGS IN THE SOFTWARE.
+
+    my @bootcodes = (
+	# Classic MBR boot code
+	pack('V*', 0x8efac033,0xbcd08ed8,0xe6897c00,0xc08e5706,0x00bffcfb,
+	     0x0100b906,0x1feaa5f3,0x52000006,0xbb41b452,0xc93155aa,0xcdf9f630,
+	     0x81137213,0x75aa55fb,0x73e9d10d,0x06c76609,0x42b4068d,0xb45a15eb,
+	     0x8313cd08,0x0f513fe1,0xf740c6b6,0x665052e1,0x9966c031,0xe80066e8,
+	     0x694d0135,0x6e697373,0x706f2067,0x74617265,0x20676e69,0x74737973,
+	     0x0d2e6d65,0x6660660a,0x00bbd231,0x6652667c,0x6a530650,0x89106a01,
+	     0x36f766e6,0xe4c07bf4,0x88e18806,0x36f692c5,0xc6887bf8,0xb841e108,
+	     0x168a0201,0x13cd7bfa,0x6610648d,0xc4e8c361,0x7dbebeff,0xb907bebf,
+	     0xa5f30020,0x896066c3,0x07bebbe5,0x310004b9,0xf65153c0,0x03748007,
+	     0x83de8940,0xf3e210c3,0x795b7448,0x8a5b5939,0x0f3c0447,0x7f240674,
+	     0x2275053c,0x08478b66,0x14568b66,0x66d00166,0x0375d221,0xe8c28966,
+	     0x0372ffac,0x66ffb6e8,0xe81c468b,0xc383ffa0,0x66cce210,0x76e8c361,
+	     0x6c754d00,0x6c706974,0x63612065,0x65766974,0x72617020,0x69746974,
+	     0x2e736e6f,0x8b660a0d,0x03660844,0x89661c46,0x30e80844,0x662772ff,
+	     0x7c003e81,0x42534658,0x83660975,0x1ce804c0,0x811372ff,0x557dfe3e,
+	     0xf2850faa,0x7bfabcfe,0xfa075f5a,0x1ee8e4ff,0x65704f00,0x69746172,
+	     0x7320676e,0x65747379,0x6f6c206d,0x65206461,0x726f7272,0x5e0a0d2e,
+	     0x8a0eb4ac,0xb304623e,0x3c10cd07,0xcdf1750a,0xfdebf418,0x00000000,
+	     0x00000000,0x00000000,0x00000000),
+
+    # GPT MBR boot code
+	pack('V*', 0x8efac033,0xbcd08ed8,0xe6897c00,0xc08e5706,0x00bffcfb,
+	     0x0100b906,0x1feaa5f3,0x52000006,0xec83e589,0xc71e6a1c,0x0200fa46,
+	     0xbb41b452,0xc93155aa,0xcdf9f630,0x08b45a13,0xfb811772,0x1175aa55,
+	     0x0d73e9d1,0x5906c766,0xeb42b407,0x8948b413,0x8313cde6,0x0f513fe1,
+	     0xf740c6b6,0x665052e1,0x9966c031,0x00dce840,0x8b564e8b,0x51505a46,
+	     0x76f7e1f7,0x664191fa,0x664e468b,0x5352568b,0xe200c4e8,0x5ff631fb,
+	     0x8b665859,0x550b6615,0x550b6604,0x550b6608,0xf60c740c,0x74043045,
+	     0x75f62106,0x01fe8919,0x21dfe2c7,0xe82e75f6,0x694d00e1,0x6e697373,
+	     0x534f2067,0xd2e80a0d,0x6c754d00,0x6c706974,0x63612065,0x65766974,
+	     0x72617020,0x69746974,0x0d736e6f,0xbebf910a,0x31665707,0x6680b0c0,
+	     0x66edb0ab,0x448b66ab,0x548b6620,0x0040e824,0x28448b66,0x2c548b66,
+	     0x20442b66,0x24541b66,0xe80070e8,0x0f66002a,0xab66c1b7,0x665ea4f3,
+	     0x6634448b,0xe838548b,0x3e810022,0xaa557dfe,0xec898575,0x66075f5a,
+	     0x504721b8,0xe4fffa54,0x74d22166,0xc8836604,0xc3ab66ff,0x667c00bb,
+	     0x66526660,0x6a530650,0x89106a01,0x76f766e6,0x06e4c0dc,0xc588e188,
+	     0xe076f692,0xe108c688,0x0201b841,0xcd00568a,0x10648d13,0x0c726166,
+	     0x66fb7e02,0x6601c083,0xc300d283,0x44000ce8,0x206b7369,0x6f727265,
+	     0x5e0a0d72,0x8a0eb4ac,0xb304623e,0x3c10cd07,0xcdf1750a,0xfdebf418,
+	     0x00000000,0x00000000,0x00000000));
+
     my($part_start, $part_len, $part_type, $chs, $active, $id) = @_;
     my $part_end = min($part_start+$part_len-1, 0xffffffff);
+
+    my $bootcode = $bootcodes[$part_type == 0xee];
+    if ($part_type == 0xee && $opt{strict}->{pmbr}) {
+	undef $bootcode;
+	undef $id;
+    }
+
     my $pe;
     if ($part_start <= 0xffffffff) {
 	$pe = pack('Ca3Ca3VV',
 		   $active ? 0x80 : 0, to_chs($part_start, $chs),
 		   $part_type, to_chs($part_end, $chs), $part_start, $part_len);
     }
-    return pack('a3.a*@440a4va64v', $KILLJMP, $KILLOFFS, $KILLBOOT,
-		$id, 0, $pe, 0xaa55);
+    return pack('a440a4va64v', $bootcode, $id, 0, $pe, 0xaa55);
 }
 
 # Create a minimal GPT partition table with one single partition.
@@ -372,8 +448,7 @@ sub gen_gpt($$$$$;$$$$) {
        $gpt_len, $part_name, $disk_guid, $part_guid, $chs) = @_;
     my @blks;
 
-    # PMBR - per spec the PMBR has no disk ID
-    $blks[0] = gen_mbr(1, $disk_len-1, 0xee, $chs);
+    $blks[0] = gen_mbr(1, $disk_len-1, 0xee, $chs, 0, $disk_guid);
 
     # GPT partition array
     $blks[2] = pack('a16a16Q<Q<Q<a142v.', $part_type, $part_guid,
@@ -1832,7 +1907,7 @@ Options:
     --mbr                Create an MBR partition table
     --gpt[=<partitions>] Create a GPT partition table [default with --efi]
 -e ,--efi, --uefi        Mark the partition as an EFI system partition
--b, --boot, --active     Mark the partition as legacy BIOS bootable
+-b, --boot, --active     Make the partition BIOS bootable
 -L, --label=<name>       Set the filesystem volume and GPT partition name
 -H, --heads=#            Define heads per cylinder for legacy geometry [255]
 -S, --secpertrack=#      Define sectors per track legacy geometry [63]

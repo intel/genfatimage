@@ -1,0 +1,2 @@
+MBR code source from the Syslinux distribution, included for
+completeness. It is not necessary to use the genfatimage script.

@@ -506,7 +506,6 @@ sub pathlist($;$) {
 	}
     }
 
-    die "$myname: empty path?: \"$path\"" if (!@path);
     return @path;
 }
 
@@ -1505,7 +1504,7 @@ sub direntry_exfat($) {
 	    $ent .= pack('CCa30', $EXFAT_NAME, 0, substr($longname, $p, 30));
 	}
     }
-    substr($ent,2,0) = pack('v', exfat_csum($ent,16)) if ($do_checksum);
+    substr($ent,2,0) = pack('v', fat_csum($ent,16)) if ($do_checksum);
     return $ent;
 }
 
@@ -1647,7 +1646,7 @@ sub emit_superblock_exfat($$) {
     $bs .= pack('.V', $parm->{sector}-4, 0xaa550000) x 8;
     $bs .= pack('.', 2*$parm->{sector});
 
-    my $checksum = exfat_csum($bs, 32);
+    my $checksum = fat_csum($bs, 32);
     $bs .= pack('V', $checksum) x ($parm->{sector} >> 2);
     # Insert the non-checksummed fields
     substr($bs, 106, 0) = pack('v', 0);

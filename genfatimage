@@ -424,6 +424,7 @@ sub gen_mbr($$$;$$$)
     my($part_start, $part_len, $part_type, $chs, $active, $id) = @_;
     my $part_end = min($part_start+$part_len-1, 0xffffffff);
     my $bootcode = $bootcodes[$part_type == 0xee];
+    $bootcode = $KILLBOOT unless ($opt{active});
 
     if ($part_type == 0xee && $opt{strict}->{pmbr}) {
 	undef $bootcode unless ($opt{active});

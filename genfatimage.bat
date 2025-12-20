@@ -1,0 +1,2305 @@
+@rem = '--*-Perl-*--
+@set "ErrorLevel="
+@if "%OS%" == "Windows_NT" @goto WinNT
+@perl -T -x -S "%0" %1 %2 %3 %4 %5 %6 %7 %8 %9
+@set ErrorLevel=%ErrorLevel%
+@goto endofperl
+:WinNT
+@perl -T -x -S %0 %*
+@set ErrorLevel=%ErrorLevel%
+@if NOT "%COMSPEC%" == "%SystemRoot%\system32\cmd.exe" @goto endofperl
+@if %ErrorLevel% == 9009 @echo You do not have Perl in your PATH.
+@goto endofperl
+@rem ';
+#!/usr/bin/perl -T
+#line 16
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright 2025 Intel Corporation - All Rights Reserved
+
+use strict;
+use integer;
+use v5.16;
+use utf8;
+no indirect;
+use warnings 'all';
+no warnings 'uninitialized';	# Allow "undef" to be treated as 0 or ""
+
+use Crypt::Random::Source;
+use Date::Parse;
+use Digest::CRC qw(crc32);
+use Digest::SHA;
+use Encode;
+use Fcntl qw(:DEFAULT :mode :seek);
+use File::Spec;
+
+# Program name and version
+my $myname		= 'genfatimage';
+my $myversion		= '0.10';
+my $mycreator		= 'GenFatIm';
+my $default_iosize	= 64 << 10;
+my $max_iosize          = 2 << 20;
+
+unless (1 << 31 << 31) {
+    die "$0: a 64-bit integer Perl interpreter is required\n";
+}
+
+# Options structure
+my %opt = (
+    # Defaults, including ones taken from the environment.
+    'verbose' => $ENV{'V'},
+    'volname' => $ENV{'VOLNAME'},
+    'gptent' => 1,		# Minimum number of GPT entries
+    'pad' => 1,			# Pad image by default
+    'backup_gpt' => 1,		# Generate backup GPT
+    'sparse' => 1,		# Sparse output
+    'strict' => {}		# Strict flags, see below
+);
+
+# Strict flags
+my %strict_help = (
+    'volsize'   => 'Enforce filesystem type volume size limits',
+    'upcase'    => 'Use Microsoft encoding for upcase table (exFAT)',
+    'fats'      => 'Require two FATs (not exFAT)',
+    'mbrspace'  => 'Add space after partition table (MBR)',
+    'cluster'   => 'Max 32K clusters (not exFAT), min 4K (FAT32)',
+    'bootspace' => 'Enforce 32-sector boot area space (FAT32)',
+    'rootdir'   => 'Enforce minimum root directory size (FAT12/16)',
+    'gptsize'   => 'Size GPT to a minimum of 128 partition entries (GPT)',
+    'creator'   => 'Set default system name to "WINNT4.1" (not exFAT)',
+    'flags'     => 'Error out on unknown --strict flags',
+    'filename'  => 'Error out on invalid filenames',
+    'pmbr'      => 'Do not include BIOS boot code or disk ID in the PMBR (GPT)'
+);
+
+# Constants for partition types; the ordering matters for command-line parsing!
+my $ANYPART = 0;
+my $FLAT    = 1;
+my $MBR     = 2;
+my $GPT     = 3;
+
+# The FAT and GPT Unicode encoding (UTF-16LE)
+my $FATUNI = Encode::find_encoding('UTF-16LE');
+# Convert a string to the "Unicode" as used by FAT and EFI
+sub to_uni($) {
+    my($s) = @_;
+    return Encode::encode($FATUNI, $s, Encode::LEAVE_SRC);
+}
+
+# This is the Microsoft-specified "frozed" upcasing table for exFAT.
+# Presumably it is also the one to use for FAT, which doesn't even
+# *have* an on-disk upcase table. The upcase table encoding in the
+# specification is suboptimal at 5836 bytes; recompressing it gives
+# a table that is 2854 bytes long. Use the official encoding if
+# $opt{strict} or with a cluster size exceeding 4K (in which case it
+# doesn't really matter.)
+sub upcase_table_expand(@) {
+    my @t = ();
+    for (my $cp = 0; $cp < 0x10000; $cp++) {
+	my $tcp = shift(@_);
+	if ($tcp == 0xffff && $cp < $tcp) {
+	    my $n = shift(@_);
+	    my $ecp = $cp+$n-1;
+	    push(@t, $cp ... $ecp);
+	    $cp = $ecp;
+	} else {
+	    push(@t, $tcp);
+	}
+    }
+    die unless (scalar(@t) == 0x10000);
+    return @t;
+}
+sub upcase_table_compress(@) {
+    my @t = ();
+    my $idem = 0;
+    my $cp = 0;
+    while (1) {
+	my $tcp = shift(@_);
+	if (defined($tcp) && $tcp == $cp) {
+	    $idem++;
+	} else {
+	    if ($idem >= 3) {
+		push(@t, 0xffff, $idem);
+	    } else {
+		push(@t, $cp-$idem ... $cp-1);
+	    }
+	    last unless (defined($tcp));
+	    push(@t, $tcp);
+	    $idem = 0;
+	}
+	$cp++;
+    }
+    die unless ($cp == 0x10000);
+    return @t;
+}
+
+my @upcase_table_msft = (
+    0x0000...0x0060,0x0041...0x005a,0x007b...0x00df,0x00c0...0x00d6,
+    0x00f7,0x00d8...0x00de,0x0178,(0x0100)x2,(0x0102)x2,(0x0104)x2,
+    (0x0106)x2,(0x0108)x2,(0x010a)x2,(0x010c)x2,(0x010e)x2,(0x0110)x2,
+    (0x0112)x2,(0x0114)x2,(0x0116)x2,(0x0118)x2,(0x011a)x2,(0x011c)x2,
+    (0x011e)x2,(0x0120)x2,(0x0122)x2,(0x0124)x2,(0x0126)x2,(0x0128)x2,
+    (0x012a)x2,(0x012c)x2,(0x012e)x2,0x0130...0x0132,0x0132,(0x0134)x2,
+    (0x0136)x2,0x0138...0x0139,0x0139,(0x013b)x2,(0x013d)x2,(0x013f)x2,
+    (0x0141)x2,(0x0143)x2,(0x0145)x2,(0x0147)x2,0x0149...0x014a,0x014a,
+    (0x014c)x2,(0x014e)x2,(0x0150)x2,(0x0152)x2,(0x0154)x2,(0x0156)x2,
+    (0x0158)x2,(0x015a)x2,(0x015c)x2,(0x015e)x2,(0x0160)x2,(0x0162)x2,
+    (0x0164)x2,(0x0166)x2,(0x0168)x2,(0x016a)x2,(0x016c)x2,(0x016e)x2,
+    (0x0170)x2,(0x0172)x2,(0x0174)x2,(0x0176)x2,0x0178...0x0179,0x0179,
+    (0x017b)x2,(0x017d)x2,0x017f,0x0243,0x0181...0x0182,0x0182,
+    (0x0184)x2,0x0186...0x0187,0x0187,0x0189...0x018b,0x018b,
+    0x018d...0x0191,0x0191,0x0193...0x0194,0x01f6,0x0196...0x0198,0x0198,
+    0x023d,0x019b...0x019d,0x0220,0x019f...0x01a0,0x01a0,(0x01a2)x2,
+    (0x01a4)x2,0x01a6...0x01a7,0x01a7,0x01a9...0x01ac,0x01ac,
+    0x01ae...0x01af,0x01af,0x01b1...0x01b3,0x01b3,(0x01b5)x2,
+    0x01b7...0x01b8,0x01b8,0x01ba...0x01bc,0x01bc,0x01be,0x01f7,
+    0x01c0...0x01c5,0x01c4,0x01c7...0x01c8,0x01c7,0x01ca...0x01cb,0x01ca,
+    (0x01cd)x2,(0x01cf)x2,(0x01d1)x2,(0x01d3)x2,(0x01d5)x2,(0x01d7)x2,
+    (0x01d9)x2,(0x01db)x2,0x018e,(0x01de)x2,(0x01e0)x2,(0x01e2)x2,
+    (0x01e4)x2,(0x01e6)x2,(0x01e8)x2,(0x01ea)x2,(0x01ec)x2,(0x01ee)x2,
+    0x01f0...0x01f2,0x01f1,(0x01f4)x2,0x01f6...0x01f8,0x01f8,(0x01fa)x2,
+    (0x01fc)x2,(0x01fe)x2,(0x0200)x2,(0x0202)x2,(0x0204)x2,(0x0206)x2,
+    (0x0208)x2,(0x020a)x2,(0x020c)x2,(0x020e)x2,(0x0210)x2,(0x0212)x2,
+    (0x0214)x2,(0x0216)x2,(0x0218)x2,(0x021a)x2,(0x021c)x2,(0x021e)x2,
+    0x0220...0x0222,0x0222,(0x0224)x2,(0x0226)x2,(0x0228)x2,(0x022a)x2,
+    (0x022c)x2,(0x022e)x2,(0x0230)x2,(0x0232)x2,0x0234...0x0239,0x2c65,
+    (0x023b)x2,0x023d,0x2c66,0x023f...0x0241,0x0241,0x0243...0x0246,
+    0x0246,(0x0248)x2,(0x024a)x2,(0x024c)x2,(0x024e)x2,0x0250...0x0252,
+    0x0181,0x0186,0x0255,0x0189...0x018a,0x0258,0x018f,0x025a,0x0190,
+    0x025c...0x025f,0x0193,0x0261...0x0262,0x0194,0x0264...0x0267,0x0197,
+    0x0196,0x026a,0x2c62,0x026c...0x026e,0x019c,0x0270...0x0271,0x019d,
+    0x0273...0x0274,0x019f,0x0276...0x027c,0x2c64,0x027e...0x027f,0x01a6,
+    0x0281...0x0282,0x01a9,0x0284...0x0287,0x01ae,0x0244,0x01b1...0x01b2,
+    0x0245,0x028d...0x0291,0x01b7,0x0293...0x037a,0x03fd...0x03ff,
+    0x037e...0x03ab,0x0386,0x0388...0x038a,0x03b0,0x0391...0x03a1,
+    (0x03a3)x2,0x03a4...0x03ab,0x038c,0x038e...0x038f,0x03cf...0x03d8,
+    0x03d8,(0x03da)x2,(0x03dc)x2,(0x03de)x2,(0x03e0)x2,(0x03e2)x2,
+    (0x03e4)x2,(0x03e6)x2,(0x03e8)x2,(0x03ea)x2,(0x03ec)x2,(0x03ee)x2,
+    0x03f0...0x03f1,0x03f9,0x03f3...0x03f7,0x03f7,0x03f9...0x03fa,0x03fa,
+    0x03fc...0x042f,0x0410...0x042f,0x0400...0x040f,(0x0460)x2,
+    (0x0462)x2,(0x0464)x2,(0x0466)x2,(0x0468)x2,(0x046a)x2,(0x046c)x2,
+    (0x046e)x2,(0x0470)x2,(0x0472)x2,(0x0474)x2,(0x0476)x2,(0x0478)x2,
+    (0x047a)x2,(0x047c)x2,(0x047e)x2,(0x0480)x2,0x0482...0x048a,0x048a,
+    (0x048c)x2,(0x048e)x2,(0x0490)x2,(0x0492)x2,(0x0494)x2,(0x0496)x2,
+    (0x0498)x2,(0x049a)x2,(0x049c)x2,(0x049e)x2,(0x04a0)x2,(0x04a2)x2,
+    (0x04a4)x2,(0x04a6)x2,(0x04a8)x2,(0x04aa)x2,(0x04ac)x2,(0x04ae)x2,
+    (0x04b0)x2,(0x04b2)x2,(0x04b4)x2,(0x04b6)x2,(0x04b8)x2,(0x04ba)x2,
+    (0x04bc)x2,(0x04be)x2,0x04c0...0x04c1,0x04c1,(0x04c3)x2,(0x04c5)x2,
+    (0x04c7)x2,(0x04c9)x2,(0x04cb)x2,(0x04cd)x2,0x04c0,(0x04d0)x2,
+    (0x04d2)x2,(0x04d4)x2,(0x04d6)x2,(0x04d8)x2,(0x04da)x2,(0x04dc)x2,
+    (0x04de)x2,(0x04e0)x2,(0x04e2)x2,(0x04e4)x2,(0x04e6)x2,(0x04e8)x2,
+    (0x04ea)x2,(0x04ec)x2,(0x04ee)x2,(0x04f0)x2,(0x04f2)x2,(0x04f4)x2,
+    (0x04f6)x2,(0x04f8)x2,(0x04fa)x2,(0x04fc)x2,(0x04fe)x2,(0x0500)x2,
+    (0x0502)x2,(0x0504)x2,(0x0506)x2,(0x0508)x2,(0x050a)x2,(0x050c)x2,
+    (0x050e)x2,(0x0510)x2,(0x0512)x2,0x0514...0x0560,0x0531...0x0556,
+    0xffff,0x17f6,0x2c63,0x1d7e...0x1e00,0x1e00,(0x1e02)x2,(0x1e04)x2,
+    (0x1e06)x2,(0x1e08)x2,(0x1e0a)x2,(0x1e0c)x2,(0x1e0e)x2,(0x1e10)x2,
+    (0x1e12)x2,(0x1e14)x2,(0x1e16)x2,(0x1e18)x2,(0x1e1a)x2,(0x1e1c)x2,
+    (0x1e1e)x2,(0x1e20)x2,(0x1e22)x2,(0x1e24)x2,(0x1e26)x2,(0x1e28)x2,
+    (0x1e2a)x2,(0x1e2c)x2,(0x1e2e)x2,(0x1e30)x2,(0x1e32)x2,(0x1e34)x2,
+    (0x1e36)x2,(0x1e38)x2,(0x1e3a)x2,(0x1e3c)x2,(0x1e3e)x2,(0x1e40)x2,
+    (0x1e42)x2,(0x1e44)x2,(0x1e46)x2,(0x1e48)x2,(0x1e4a)x2,(0x1e4c)x2,
+    (0x1e4e)x2,(0x1e50)x2,(0x1e52)x2,(0x1e54)x2,(0x1e56)x2,(0x1e58)x2,
+    (0x1e5a)x2,(0x1e5c)x2,(0x1e5e)x2,(0x1e60)x2,(0x1e62)x2,(0x1e64)x2,
+    (0x1e66)x2,(0x1e68)x2,(0x1e6a)x2,(0x1e6c)x2,(0x1e6e)x2,(0x1e70)x2,
+    (0x1e72)x2,(0x1e74)x2,(0x1e76)x2,(0x1e78)x2,(0x1e7a)x2,(0x1e7c)x2,
+    (0x1e7e)x2,(0x1e80)x2,(0x1e82)x2,(0x1e84)x2,(0x1e86)x2,(0x1e88)x2,
+    (0x1e8a)x2,(0x1e8c)x2,(0x1e8e)x2,(0x1e90)x2,(0x1e92)x2,(0x1e94)x2,
+    0x1e96...0x1ea0,0x1ea0,(0x1ea2)x2,(0x1ea4)x2,(0x1ea6)x2,(0x1ea8)x2,
+    (0x1eaa)x2,(0x1eac)x2,(0x1eae)x2,(0x1eb0)x2,(0x1eb2)x2,(0x1eb4)x2,
+    (0x1eb6)x2,(0x1eb8)x2,(0x1eba)x2,(0x1ebc)x2,(0x1ebe)x2,(0x1ec0)x2,
+    (0x1ec2)x2,(0x1ec4)x2,(0x1ec6)x2,(0x1ec8)x2,(0x1eca)x2,(0x1ecc)x2,
+    (0x1ece)x2,(0x1ed0)x2,(0x1ed2)x2,(0x1ed4)x2,(0x1ed6)x2,(0x1ed8)x2,
+    (0x1eda)x2,(0x1edc)x2,(0x1ede)x2,(0x1ee0)x2,(0x1ee2)x2,(0x1ee4)x2,
+    (0x1ee6)x2,(0x1ee8)x2,(0x1eea)x2,(0x1eec)x2,(0x1eee)x2,(0x1ef0)x2,
+    (0x1ef2)x2,(0x1ef4)x2,(0x1ef6)x2,(0x1ef8)x2,0x1efa...0x1eff,
+    0x1f08...0x1f0f,0x1f08...0x1f0f,0x1f18...0x1f1d,0x1f16...0x1f1f,
+    0x1f28...0x1f2f,0x1f28...0x1f2f,0x1f38...0x1f3f,0x1f38...0x1f3f,
+    0x1f48...0x1f4d,0x1f46...0x1f50,0x1f59,0x1f52,0x1f5b,0x1f54,0x1f5d,
+    0x1f56,0x1f5f,0x1f58...0x1f5f,0x1f68...0x1f6f,0x1f68...0x1f6f,
+    0x1fba...0x1fbb,0x1fc8...0x1fcb,0x1fda...0x1fdb,0x1ff8...0x1ff9,
+    0x1fea...0x1feb,0x1ffa...0x1ffb,0x1f7e...0x1f7f,0x1f88...0x1f8f,
+    0x1f88...0x1f8f,0x1f98...0x1f9f,0x1f98...0x1f9f,0x1fa8...0x1faf,
+    0x1fa8...0x1faf,0x1fb8...0x1fb9,0x1fb2,0x1fbc,0x1fb4...0x1fcb,0x1fc3,
+    0x1fcd...0x1fcf,0x1fd8...0x1fd9,0x1fd2...0x1fdf,0x1fe8...0x1fe9,
+    0x1fe2...0x1fe4,0x1fec,0x1fe6...0x1ffb,0x1ff3,0x1ffd...0x214d,0x2132,
+    0x214f...0x216f,0x2160...0x216f,0x2180...0x2183,0x2183,0xffff,0x034b,
+    0x24b6...0x24cf,0xffff,0x0746,0x2c00...0x2c2e,0x2c5f...0x2c60,0x2c60,
+    0x2c62...0x2c67,0x2c67,(0x2c69)x2,(0x2c6b)x2,0x2c6d...0x2c75,0x2c75,
+    0x2c77...0x2c80,0x2c80,(0x2c82)x2,(0x2c84)x2,(0x2c86)x2,(0x2c88)x2,
+    (0x2c8a)x2,(0x2c8c)x2,(0x2c8e)x2,(0x2c90)x2,(0x2c92)x2,(0x2c94)x2,
+    (0x2c96)x2,(0x2c98)x2,(0x2c9a)x2,(0x2c9c)x2,(0x2c9e)x2,(0x2ca0)x2,
+    (0x2ca2)x2,(0x2ca4)x2,(0x2ca6)x2,(0x2ca8)x2,(0x2caa)x2,(0x2cac)x2,
+    (0x2cae)x2,(0x2cb0)x2,(0x2cb2)x2,(0x2cb4)x2,(0x2cb6)x2,(0x2cb8)x2,
+    (0x2cba)x2,(0x2cbc)x2,(0x2cbe)x2,(0x2cc0)x2,(0x2cc2)x2,(0x2cc4)x2,
+    (0x2cc6)x2,(0x2cc8)x2,(0x2cca)x2,(0x2ccc)x2,(0x2cce)x2,(0x2cd0)x2,
+    (0x2cd2)x2,(0x2cd4)x2,(0x2cd6)x2,(0x2cd8)x2,(0x2cda)x2,(0x2cdc)x2,
+    (0x2cde)x2,(0x2ce0)x2,(0x2ce2)x2,0x2ce4...0x2cff,0x10a0...0x10c5,
+    0xffff,0xd21b,0xff21...0xff3a,0xff5b...0xffff
+);
+
+my @upcase_table = upcase_table_expand(@upcase_table_msft);
+my $upcase_table_msft = pack('v*', @upcase_table_msft);
+my $upcase_table_minimal = pack('v*', upcase_table_compress(@upcase_table));
+# Upcase an UTF-16LE string accoding to the expanded upcase table
+sub upcase_longname($) {
+    my($s) = @_;
+    return pack('v*', map { $upcase_table[$_] } unpack('v*', $s));
+}
+
+# --- Utility functions ---
+
+sub min(@) {
+    my $x;
+    foreach my $y (@_) {
+	next unless (defined($y));
+	$x = $y if (!defined($x) || $y < $x);
+    }
+    return $x;
+}
+sub max(@) {
+    my $x;
+    foreach my $y (@_) {
+	next unless (defined($y));
+	$x = $y if (!defined($x) || $y > $x);
+    }
+    return $x;
+}
+
+sub align_down($$) {
+    my($val, $align) = @_;
+    return $val - ($val % $align);
+}
+sub align_up($$) {
+    my($val, $align) = @_;
+    return align_down($val + $align - 1, $align);
+}
+sub div_up($$) {
+    my($val, $divisor) = @_;
+    return ($val + $divisor - 1)/$divisor;
+}
+# Compute -$a % $b giving a nonnegative remainder; assumes $a, $b >= 0
+sub npad($$) {
+    my($a, $b) = @_;
+    my $r = -$a % $b;
+    $r += $b if ($r < 0);
+    return $r;
+}
+# Untaint a scalar value as long as it is *already* a valid nonnegative integer
+sub untaint_uint($) {
+    my($n) = @_;
+    my $m = $n + 0;
+    die if ($m < 0 || $n ne $m || $n !~ /^([0-9]{1,20})$/a);
+    return $1 + 0;
+}
+
+# Code to kill a BIOS boot: 1: int $0x80; hlt; jmp 1b
+my $KILLBOOT = "\xcd\x18\xf4\xeb\xfb";
+my $KILLOFFS = 0x78;		# Per the exFAT specification 3.1.1
+my $KILLJMP  = $KILLOFFS < 0x82
+    ? pack("CCC", 0xeb, $KILLOFFS-2, 0x90)
+    : pack("Cv",  0xe9, $KILLOFFS-3);
+
+# Generate random or pseudorandom bytes depending on if --random is enabled
+my $pseudo_random_buf;		# Hash or dummy seed; undef for random
+sub rand_bytes($) {
+    my($count) = @_;
+    my $o;
+
+    if (defined($pseudo_random_buf)) {
+	$o = substr($pseudo_random_buf, 0, $count);
+	$pseudo_random_buf = substr($pseudo_random_buf, $count);
+    } elsif (Crypt::Random::Source->VERSION < 0.13) {
+	$o = Crypt::Random::Source::get_strong($count);
+    } else {
+	$o = Crypt::Random::Source::get_weak($count);
+    }
+    die if (length($o) != $count);
+    return $o;
+}
+sub rand_guid() {
+    my @b = unpack('C*', rand_bytes(16));
+    # Version 4: random, version 8: custom algorithm
+    $b[7] = ($b[7] & 0x0f) | ($opt{random} ? 0x40 : 0x80);
+    $b[8] = ($b[8] & 0x3f) | 0x80;
+    return pack('C*', @b);
+}
+sub parse_guid($) {
+    my($s) = @_;
+    my @bpos = (3,2,1,0,5,4,7,6,8 ... 15); # Weird byte order...
+    if ($s =~ s/^(0[xX]|\$)//i) {
+	@bpos = (0 ... 15);
+    }
+    $s =~ s/[^a-z0-9]//ig;
+
+    return rand_guid() if ($s eq '');
+
+    my $guid = pack('.', 16);
+    for (my $i = 0; $i < 16; $i++) {
+	my $h = substr($s,$i << 1,2);
+	substr($guid,$bpos[$i],1) = pack('C', hex $h);
+    }
+    return $guid;
+}
+sub guid_str($;$) {
+    my($guid, $short) = @_;
+    if ($short) {
+	my @w = unpack('vv', $guid);
+	return sprintf('%04X-%04X', $w[1], $w[0]);
+    } else {
+	my @w = unpack('VvvnnN', $guid."\0\0");
+	return sprintf('%08X-%04X-%04X-%04X-%04X%08X', @w);
+    }
+}
+
+sub to_chs($$) {
+    my($lba, $chs) = @_;
+    my $s = ($lba % $chs->[2]) + 1;
+    my $t = $lba / $chs->[2];
+    my $h = $t % $chs->[1];
+    my $c = $t / $chs->[1];
+    ($c,$h,$s) = (1023,$chs->[1]-1,$chs->[2]) if ($c > 1023);
+    return pack('C3', $h, ($c >> 2)|$s, $c & 0xff);
+}
+# Create a minimal MBR partition table with one single partition.
+sub gen_mbr($$$;$$$)
+{
+    # MBR boot code, from the Syslinux distribution version 6.04-pre1.
+    #
+    #   Copyright 2007-2009 H. Peter Anvin - All Rights Reserved
+    #   Copyright 2009-2010 Intel Corporation; author: H. Peter Anvin
+    #
+    #   Permission is hereby granted, free of charge, to any person
+    #   obtaining a copy of this software and associated documentation
+    #   files (the "Software"), to deal in the Software without
+    #   restriction, including without limitation the rights to use,
+    #   copy, modify, merge, publish, distribute, sublicense, and/or
+    #   sell copies of the Software, and to permit persons to whom
+    #   the Software is furnished to do so, subject to the following
+    #   conditions:
+    #
+    #   The above copyright notice and this permission notice shall
+    #   be included in all copies or substantial portions of the Software.
+    #
+    #   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    #   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+    #   OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+    #   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+    #   HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+    #   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    #   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+    #   OTHER DEALINGS IN THE SOFTWARE.
+
+    my @bootcodes = (
+	# Classic MBR boot code
+	pack('V*', 0x8efac033,0xbcd08ed8,0xe6897c00,0xc08e5706,0x00bffcfb,
+	     0x0100b906,0x1feaa5f3,0x52000006,0xbb41b452,0xc93155aa,0xcdf9f630,
+	     0x81137213,0x75aa55fb,0x73e9d10d,0x06c76609,0x42b4068d,0xb45a15eb,
+	     0x8313cd08,0x0f513fe1,0xf740c6b6,0x665052e1,0x9966c031,0xe80066e8,
+	     0x694d0135,0x6e697373,0x706f2067,0x74617265,0x20676e69,0x74737973,
+	     0x0d2e6d65,0x6660660a,0x00bbd231,0x6652667c,0x6a530650,0x89106a01,
+	     0x36f766e6,0xe4c07bf4,0x88e18806,0x36f692c5,0xc6887bf8,0xb841e108,
+	     0x168a0201,0x13cd7bfa,0x6610648d,0xc4e8c361,0x7dbebeff,0xb907bebf,
+	     0xa5f30020,0x896066c3,0x07bebbe5,0x310004b9,0xf65153c0,0x03748007,
+	     0x83de8940,0xf3e210c3,0x795b7448,0x8a5b5939,0x0f3c0447,0x7f240674,
+	     0x2275053c,0x08478b66,0x14568b66,0x66d00166,0x0375d221,0xe8c28966,
+	     0x0372ffac,0x66ffb6e8,0xe81c468b,0xc383ffa0,0x66cce210,0x76e8c361,
+	     0x6c754d00,0x6c706974,0x63612065,0x65766974,0x72617020,0x69746974,
+	     0x2e736e6f,0x8b660a0d,0x03660844,0x89661c46,0x30e80844,0x662772ff,
+	     0x7c003e81,0x42534658,0x83660975,0x1ce804c0,0x811372ff,0x557dfe3e,
+	     0xf2850faa,0x7bfabcfe,0xfa075f5a,0x1ee8e4ff,0x65704f00,0x69746172,
+	     0x7320676e,0x65747379,0x6f6c206d,0x65206461,0x726f7272,0x5e0a0d2e,
+	     0x8a0eb4ac,0xb304623e,0x3c10cd07,0xcdf1750a,0xfdebf418,0x00000000,
+	     0x00000000,0x00000000,0x00000000),
+
+    # GPT MBR boot code
+	pack('V*', 0x8efac033,0xbcd08ed8,0xe6897c00,0xc08e5706,0x00bffcfb,
+	     0x0100b906,0x1feaa5f3,0x52000006,0xec83e589,0xc71e6a1c,0x0200fa46,
+	     0xbb41b452,0xc93155aa,0xcdf9f630,0x08b45a13,0xfb811772,0x1175aa55,
+	     0x0d73e9d1,0x5906c766,0xeb42b407,0x8948b413,0x8313cde6,0x0f513fe1,
+	     0xf740c6b6,0x665052e1,0x9966c031,0x00dce840,0x8b564e8b,0x51505a46,
+	     0x76f7e1f7,0x664191fa,0x664e468b,0x5352568b,0xe200c4e8,0x5ff631fb,
+	     0x8b665859,0x550b6615,0x550b6604,0x550b6608,0xf60c740c,0x74043045,
+	     0x75f62106,0x01fe8919,0x21dfe2c7,0xe82e75f6,0x694d00e1,0x6e697373,
+	     0x534f2067,0xd2e80a0d,0x6c754d00,0x6c706974,0x63612065,0x65766974,
+	     0x72617020,0x69746974,0x0d736e6f,0xbebf910a,0x31665707,0x6680b0c0,
+	     0x66edb0ab,0x448b66ab,0x548b6620,0x0040e824,0x28448b66,0x2c548b66,
+	     0x20442b66,0x24541b66,0xe80070e8,0x0f66002a,0xab66c1b7,0x665ea4f3,
+	     0x6634448b,0xe838548b,0x3e810022,0xaa557dfe,0xec898575,0x66075f5a,
+	     0x504721b8,0xe4fffa54,0x74d22166,0xc8836604,0xc3ab66ff,0x667c00bb,
+	     0x66526660,0x6a530650,0x89106a01,0x76f766e6,0x06e4c0dc,0xc588e188,
+	     0xe076f692,0xe108c688,0x0201b841,0xcd00568a,0x10648d13,0x0c726166,
+	     0x66fb7e02,0x6601c083,0xc300d283,0x44000ce8,0x206b7369,0x6f727265,
+	     0x5e0a0d72,0x8a0eb4ac,0xb304623e,0x3c10cd07,0xcdf1750a,0xfdebf418,
+	     0x00000000,0x00000000,0x00000000));
+
+    my($part_start, $part_len, $part_type, $chs, $active, $id) = @_;
+    my $part_end = min($part_start+$part_len-1, 0xffffffff);
+    my $bootcode = $bootcodes[$part_type == 0xee];
+    $bootcode = $KILLBOOT unless ($opt{active});
+
+    if ($part_type == 0xee && $opt{strict}->{pmbr}) {
+	undef $bootcode unless ($opt{active});
+	undef $id;
+    }
+
+    my $pe;
+    if ($part_start <= 0xffffffff) {
+	$pe = pack('Ca3Ca3VV',
+		   $active ? 0x80 : 0, to_chs($part_start, $chs),
+		   $part_type, to_chs($part_end, $chs), $part_start, $part_len);
+    }
+    return pack('a440a4va64v', $bootcode, $id, 0, $pe, 0xaa55);
+}
+
+# Create a minimal GPT partition table with one single partition.
+# Return a vector containing the PMBR, the GPT header,
+# the GPT array, and the backup GPT header in that order.
+# $gpt_len is the desired size of the GPT array in sectors.
+sub gen_gpt($$$$$;$$$$) {
+    my($disk_len, $part_start, $part_len, $part_type,
+       $gpt_len, $part_name, $disk_guid, $part_guid, $chs) = @_;
+    my @blks;
+
+    $blks[0] = gen_mbr(1, $disk_len-1, 0xee, $chs, 0, $disk_guid);
+
+    # GPT partition array
+    $blks[2] = pack('a16a16Q<Q<Q<a142v.', $part_type, $part_guid,
+		    $part_start, $part_start + $part_len - 1,
+		    ($opt{efi} ? 1 : 0) | ($opt{active} ? 4 : 0),
+		    to_uni($part_name), 0,
+		    $gpt_len << 9);
+    my $array_crc = crc32($blks[2]);
+
+    # GPT headers (primary and alternate)
+    my $backup_gpt = $disk_len - ($opt{backup_gpt} ? 1+$gpt_len : 0);
+    my @hdrs = ([1, 1, $backup_gpt+$gpt_len, 2]);
+    push(@hdrs, [3, $backup_gpt+$gpt_len, 1, $backup_gpt]) if ($opt{backup_gpt});
+    foreach my $hdr (@hdrs) {
+	my($i, $here, $there, $array) = @$hdr;
+	$blks[$i] =
+	    pack('a8VVVVQ<Q<Q<Q<a16Q<VVV', 'EFI PART', 0x10000, 92, 0, 0,
+		 $here, $there, $gpt_len+2, $backup_gpt,
+		 $disk_guid, $array, $gpt_len << 2, 128, $array_crc);
+
+	my $hdr_crc = crc32($blks[$i]);
+	substr($blks[$i], 16, 4) = pack('V', $hdr_crc);
+	$blks[$i] .= ("\0" x (512 - length($blks[$i])));
+    }
+
+    return @blks;
+}
+
+# Create a normalization of a pathname as a list suitable for
+# inserting in the directory tree.
+sub pathlist($;$) {
+    my($path, $from_host) = @_;
+    my @rawpath;
+    my($curdir, $updir);
+
+    if ($from_host) {
+	my @sp   = File::Spec->splitpath($path);
+	my $cp   = File::Spec->catpath(undef, $sp[1], $sp[2]);
+	@rawpath = File::Spec->splitdir($cp);
+	$curdir  = File::Spec->curdir();
+	$updir   = File::Spec->updir();
+    } else {
+	@rawpath = split(/[\/\\]+/, $path);
+	$curdir  = '.';
+	$updir   = '..';
+    }
+
+    my @path;
+    foreach my $rp (@rawpath) {
+	my $vn = $rp;
+	if ($rp eq '' || $rp eq $curdir) {
+	    next;
+	} elsif ($rp eq $updir) {
+	    pop(@path);
+	} else {
+	    push(@path, $rp);
+	}
+    }
+
+    return @path;
+}
+
+# Error counter
+my $err = 0;
+
+# Directory entry types and flags, and lists of nodes of each type
+# Note that file attributes are stored in {attr}, and so don't directly
+# conflict with types.
+my $EXFAT    = 0x01;		# Type: exFAT special entry
+my $READONLY = 0x01;		# File attribute
+my $HIDDEN   = 0x02;		# File attribute
+my $SYSTEM   = 0x04;		# File attribute
+my $VOL      = 0x08;		# Type: volume label
+my $LONGNAME = 0x0f;		# FAT long filename directory entry
+my $DIR      = 0x10;		# Type: directory
+my $ARCHIVE  = 0x20;		# File attribute
+my $ATTRMASK = 0x3f;		# The only bits valid in a directory entry
+my $FILE     = 0x40;		# Type: file
+
+my %typename = ($FILE => 'file', $DIR => 'directory', $VOL => 'volume',
+		$EXFAT => 'special', 0 => 'unknown');
+
+# exFAT directory entry types
+my $EXFAT_BITMAP = 0x81;
+my $EXFAT_UPCASE = 0x82;
+my $EXFAT_VOL    = 0x83;
+my $EXFAT_FILE   = 0x85;
+my $EXFAT_STREAM = 0xc0;
+my $EXFAT_NAME   = 0xc1;
+my $EXFAT_VOLID  = 0xa0;
+
+# Normalize a filename coming from host space stripping things
+# unsuitable for the FAT longname and forcing Perl to convert
+# a string to characters rather than bytes
+sub normalize_filename($) {
+    my($vn) = @_;
+    # Normalize name; this affects the retained name
+    $vn = decode_utf8($vn);	# Convert to characters
+    my $nn = $vn;
+    $nn =~ s/[\x00-\x1f\x7f"*\/:<>?\\|]/_/g;
+    $nn =~ s/^(\s)/_$1/;
+    $nn =~ s/([\.\s])$/$1_/;
+    if ($opt{strict}->{filename} && $nn ne $vn) {
+	print STDERR "$opt{outfile}: invalid (ex)FAT filename: \"$vn\"\n";
+	$err++;
+    }
+    return $nn;
+}
+
+sub set_node_type($$;$) {
+    my($node, $type, $inpath) = @_;
+    if ($node->{type}) {
+	if ($node->{type} != $type) {
+	    printf STDERR "%s: %s: type conflict: %s and %s\n",
+		$opt{outfile}, $node->{path},
+		$typename{$node->{type}}, $typename{$type};
+	    $err++;
+	    return 0;
+	}
+    } else {
+	$node->{type} = $type;
+	$node->{attr} |= $type & ($DIR|$VOL);
+	push(@{$node->{root}->{nodes}->{$type}}, $node);
+	$node->{files} = {} if ($type == $DIR);
+    }
+    $node->{inpath} = $inpath;
+    return 1;
+}
+
+# Creates or finds a node in the directory tree from a list of names
+# and returns a reference to it
+sub mktreenode($@) {
+    my($here, @path) = @_;
+
+    foreach my $p (@path) {
+	my $herepath = $here->{path};
+
+	return undef unless (set_node_type($here, $DIR));
+
+	my $f = normalize_filename($p);
+	my $longname = genlongname($f);
+	my $uf = upcase_longname($longname); # If this is the same, collision
+	my $there = $here;
+	$here = $there->{files}->{$uf};
+	if (!defined($here)) {
+	    # New directory entry, unknown type so far
+	    $here = {
+		'root' => $there->{root}, 'up' => $there, 'name' => $f,
+		'longname' => $longname, 'path' => $herepath.'/'.$f
+	    };
+	    $there->{files}->{$uf} = $here;
+	}
+    }
+
+    return $here;
+}
+
+sub inputnode($$) {
+    my($root, $inpath) = @_;
+    my $destpath;
+    my $keeppath;
+
+    if ($inpath =~ s/^(:|([^:]*)::)//) {
+	$destpath = $2;
+	$keeppath = $1 eq '::';
+    }
+
+    my @st = stat($inpath);
+    if (!@st) {
+	print STDERR "$inpath: path not found\n";
+	$err++;
+	return;
+    }
+    my $mode = $st[2];
+
+    my @dest;
+    my @ipl = pathlist($inpath, 1);
+    if ($keeppath) {
+	@dest = @ipl;
+    } elsif (!defined($destpath)) {
+	@dest = ();
+	push(@dest, $ipl[-1]) if (S_ISREG($mode));
+    } else {
+	@dest = pathlist($destpath, 0);
+	if ($destpath =~ /^[\/\\]$/) {
+	    push(@dest, $ipl[-1]);
+	}
+    }
+
+    my $dest = mktreenode($root, @dest);
+    $dest->{inpath} = $inpath if (defined($dest));
+    return $dest;
+}
+
+# Create the root directory node
+sub rootdir() {
+    my $root = {'path' => undef, 'name' => undef};
+    $root->{root} = $root;
+    $root->{nodes} = { $FILE => [], $VOL => [], $EXFAT => [], $DIR => [] };
+    set_node_type($root, $DIR);
+    return $root;
+}
+
+# Append a name to a directory path in host space
+sub cat_path($$) {
+    my($dir, $file) = @_;
+
+    my @sp = File::Spec->splitpath($dir);
+    $sp[1] = ($sp[1] eq '' || $sp[1] eq File::Spec->curdir)
+	? $sp[2] : File::Spec->catdir($sp[1], $sp[2]);
+    $sp[2] = $file;
+    return File::Spec->catpath(@sp);
+}
+
+sub node_date($) {
+    my($node) = @_;
+
+    while ($node) {
+	return $node->{date} if ($node->{date});
+	$node = $node->{up};
+    }
+    return [(1 << 21) + (1 << 16), 0, 0, 0];
+}
+
+# Add an input file or directory to a directory node
+sub add_input($;$);		# Avoid warning due to recursive call
+sub add_input($;$) {
+    my($dest, $inpath) = @_;
+    return undef unless (defined($dest));
+
+    $inpath = $dest->{inpath} unless (defined($inpath));
+
+    my @st = stat($inpath);
+    if (!@st) {
+	print STDERR "$opt{outfile}: input not found: $inpath\n";
+	return;
+    }
+    my $mode = $st[2];
+    my $date = $opt{date};
+    if (!$date) {
+	$date = node_date($dest);
+	$date = dosdate($st[9]) if ($date->[3] < $st[9]);
+    }
+
+    if (S_ISDIR($mode)) {
+	if (!set_node_type($dest, $DIR, $inpath)) {
+	    $err++;
+	    return;
+	}
+	my $dh;
+	if (!opendir($dh, $inpath)) {
+	    printf STDERR "%s: cannot scan input directory: %s: %s\n",
+		$opt{outfile}, $inpath, $!;
+	    $err++;
+	    return;
+	}
+	while (defined(my $de = readdir($dh))) {
+	    next if ($de eq File::Spec->curdir() || $de eq File::Spec->updir());
+	    my $node = mktreenode($dest, $de);
+	    add_input($node, cat_path($inpath, $de));
+	}
+	closedir($dh);
+    } elsif (S_ISREG($mode)) {
+	if (!set_node_type($dest, $FILE, $inpath)) {
+	    $err++;
+	    return;
+	}
+	$dest->{size} = $st[7];
+	if ($st[7] > 0xffffffff) {
+	    $dest->{size} = 0xffffffff;
+	    $dest->{exsize} = $st[7];
+	    $dest->{root}->{largefile} = 1;
+	    if (!$opt{exfat}) {
+		print STDERR "$opt{outfile}: file too large, need exFAT: $inpath\n";
+		$err++;
+	    }
+	}
+	# Readonly and archive bits
+	my $ro = defined($opt{readonly}) ? $opt{readonly} : !($mode & S_IWRITE);
+	$dest->{attr} |= $READONLY if ($ro);
+	$dest->{attr} |= $ARCHIVE  if ($opt{archive});
+    } else {
+	printf STDERR "$opt{outfile}: warning: skipping non-regular file: $inpath\n";
+	return;
+    }
+    # Successful!
+    $dest->{date} = $date;
+}
+
+#
+# Read all the input files
+#
+sub read_inputs(@) {
+    my(@inputs) = @_;
+
+    my $root = rootdir();
+    foreach my $input (@inputs) {
+	add_input(inputnode($root, $input));
+    }
+
+    return $root;
+}
+
+# Convert a longname to UTF-16LE and pad it
+sub genlongname($) {
+    my($s) = @_;
+    return substr(to_uni($s), 0, 255 << 1);
+}
+
+# Generate a short filename. For simplicity, only consider
+# non-whitespace ASCII characters as valid shortname characters, even
+# though that is needlessly strict. This also avoids the special handling
+# of 0xe5 as the first byte. $shorthash is a reference to a
+# hash for the directory within which the conversion is happening.
+
+# For each string reference in the list, strip invalid shortname
+# characters (including .) in place and return 1 if the conversion was
+# inexact except for case.
+sub to_valid_shortchar(@) {
+    my $inexact = 0;
+    foreach my $i (@_) {
+	$$i = uc($$i);
+	$inexact = 1 if ($$i =~ s/[^!\#-\)\-0-9\@-Z^-\{\}~]+/_/g);
+    }
+    return $inexact;
+}
+
+sub genshortname($$$) {
+    my($fullname, $shorthash, $type) = @_;
+    if ($type & ($VOL|$EXFAT)) {
+	# The rules for volume labels are much less strict,
+	# and exfat entries are irrelevant here
+	(my $lbl = $fullname) =~ s/[^ -~]/_/g;
+	return pack('A11', $lbl);
+    }
+
+    # If this doesn't match then the name is empty...
+    die unless ($fullname =~ /^(.+?)(?:\.([^.]+))?$/);
+    my $head = $1;
+    my $ext  = $2;
+    my $inexact = to_valid_shortchar(\$head, \$ext);
+
+    $inexact = 1 if ($head eq '' || length($head) > 8);
+    $inexact = 1 if (length($ext) > 3);
+
+    for (my $ctr = $inexact; $ctr <= 99999; $ctr++) {
+	my $ctrtail = $ctr ? '~'.$ctr : '';
+	my $xhead = substr($head, 0, 8-length($ctrtail));
+	my $xname = pack('A8A3', $xhead.$ctrtail, $ext);
+	if (!defined($shorthash->{$xname})) {
+	    if ($opt{verbose} >= 3) {
+		print STDERR "$opt{outfile}: short \"$xname\" for \"$fullname\"\n";
+	    }
+	    $shorthash->{$xname} = $fullname;
+	    return $xname;
+	}
+    }
+
+    die "$opt{outfile}: directory too long\n";
+}
+
+# Compute directory sizes and generate the sorted list of
+# directory entries, and assign short names (long names should already
+# have been assigned)
+sub prep_directories($) {
+    my($root) = @_;
+
+    # Add exFAT special directory entries (ignored for FAT).
+    # Data is filled in later on...
+    $root->{fatchain} = 1;
+    my $exfat_bitmap = {'root' => $root, 'up' => $root, 'fatchain' => 1,
+			'extype' => $EXFAT_BITMAP, 'name' => ':bitmap',
+			'path' => '<bitmap>'};
+    set_node_type($root->{files}->{"\0\0bitmap"} = $exfat_bitmap, $EXFAT);
+    my $exfat_upcase = {'root' => $root, 'up' => $root, 'fatchain' => 1,
+			'extype' => $EXFAT_UPCASE, 'name' => ':upcase',
+			'path' => '<upcase>'};
+    set_node_type($root->{files}->{"\0\0upcase"} = $exfat_upcase, $EXFAT);
+    my $exfat_volid = {'root' => $root, 'up' => $root, 'name' => ':volid',
+		       'extype' => $EXFAT_VOLID, 'path' => '<volid>'};
+    set_node_type($root->{files}->{"\0\0volid"} = $exfat_volid, $EXFAT);
+
+    foreach my $d (@{$root->{nodes}->{$DIR}}) {
+	my %shorthash;
+	my @filelist = sort {
+	    $a->{type} <=> $b->{type} || $a->{name} cmp $b->{name}
+        } values(%{$d->{files}});
+	$d->{filelist} = \@filelist;
+
+	my $e  = 2;		# . and ..
+	my $ee = 0;
+	# FAT:   One entry for each 13 UTF-16 codepoints, plus one
+	# exFAT: One entry for each 15 UTF-16 codepoints, plus two
+	foreach my $f (@filelist) {
+	    $f->{shortname} = genshortname($f->{name}, \%shorthash, $f->{type});
+	    $e +=  $f->{type} != $EXFAT
+		? div_up(length($f->{longname}), 26) + 1 : 0;
+	    $ee += $f->{type} > $VOL
+		? div_up(length($f->{longname}), 30) + 2 : 1;
+	}
+	$d->{size}   = $e << 5;
+	$d->{exsize} = $ee << 5;
+    }
+
+    $root->{size}   -= 2 << 5;	# No . and .. in the root
+}
+
+sub count_clusters($$;$) {
+    my($root, $cbytes, $exfat) = @_;
+    my $clust = 0;
+    # Iterate over all nodes of all types
+    foreach my $f (map { @$_ } values(%{$root->{nodes}})) {
+	my $size;
+	die if ($f->{type} == $EXFAT && $f->{size});
+	if ($exfat) {
+	    $size = defined($f->{exsize}) ? $f->{exsize} : $f->{size};
+	} else {
+	    $size = $f->{size};
+	}
+	$clust += div_up($size, $cbytes);
+    }
+    return $clust;
+}
+
+# GPT partition types
+my @gpt_types = (
+    # Microsoft basic data type (including exFAT)
+    parse_guid('EBD0A0A2-B9E5-4433-87C0-68B6B72699C7'),
+    # EFI system type
+    parse_guid('C12A7328-F81F-11D2-BA4B-00A0C93EC93B')
+);
+
+# Create preliminary format parameters for a specific cluster size.
+# These will be made exact by finalize_format_params() later.
+sub get_format_params($$;$) {
+    my($root, $cshift, $exfat) = @_;
+
+    return undef unless ($cshift <= 7 || $exfat);
+
+    my $secshift = 9;
+    my $sector = 1 << $secshift;
+    my $csize = 1 << $cshift;
+    my $cbshift = $cshift + $secshift;
+    my $cbytes = 1 << $cbshift;
+    my $salign = $opt{align} ? $csize : 1;
+    my $balign = $salign << $secshift;
+
+    my $c = count_clusters($root, $cbytes, $exfat);
+    my $fattype;
+    my $nfats = (!$exfat && $opt{strict}->{fats}) ? 2 : 1;
+
+    # Partition table alignment quantum
+    my $partalign = max($salign, $opt{strict}->{partspace} ? 64 : 1);
+
+    # Reserved space; if the "extra files" part is set make sure there is at
+    # least one free cluster per file, and enough space to put any
+    # reserved files in subdirectories.
+    #
+    # Syntax: --reserve=<files>,<bytes>,<rootfiles>,<namelen>
+    my @res = $opt{reserve} ? @{$opt{reserve}} : ();
+    $res[0] = max($res[0], $res[2]);
+    my $dirbytesperfile;
+    if ($exfat) {
+	$dirbytesperfile = (2 + div_up($res[3] || 64, 15)) << 5;
+    } else {
+	$dirbytesperfile = (1 + div_up($res[3] || 64, 13)) << 5;
+    }
+    $c += $res[0] + div_up($res[1], $cbytes);
+    $c += div_up($dirbytesperfile * $res[0], $cbytes);
+
+    my $rootclusts = div_up($root->{size}, $cbytes);
+    $c -= $rootclusts unless ($exfat || $c - $rootclusts >= 0xfff5);
+
+    # FAT type == bits per entry
+    my $strictminsize;
+    if ($exfat) {
+	$fattype = 32;
+	$strictminsize = 1 << 20;
+    } elsif ($c < 0xff5) {
+	$fattype = 12;
+    } elsif ($c < 0xfff5) {
+	$fattype = 16;
+    } elsif ($c < 0x0ffffff5) {
+	$fattype = 32;
+	$strictminsize = 1 << 29;
+	return undef if ($cshift < 3 && $opt{strict}->{cluster});
+    } else {
+	return undef;		# Does not fit
+    }
+
+    # exFAT fixed structures
+    my $bitmapclust;
+    my $upcase_table;
+    if ($exfat) {
+	# Upcase table
+	$upcase_table =
+	    $opt{strict}->{upcase} || $cbytes >= length($upcase_table_msft)
+	    ? \$upcase_table_msft : \$upcase_table_minimal;
+	$c += div_up(length($$upcase_table), $cbytes);
+
+	# Allocation bitmap. This one is "fun", as its size depends on
+	# the cluster count but might itself increase the necessary cluster
+	# count...
+	my $needbitmap;
+	do {
+	    $bitmapclust = $needbitmap;
+	    $needbitmap = div_up($c + $bitmapclust, $cbytes << 3);
+	} while ($needbitmap > $bitmapclust);
+	$c += $bitmapclust;
+    }
+
+    # For FAT32 and exFAT, enforce a minimum size if strict
+    $c = max($c, div_up($strictminsize, $cbytes)) if ($opt{strict});
+    my $sectors = $c << $cshift;
+
+    # Size of each FAT
+    my $fatsize = div_up(($c+2)*$fattype, 8);		 # Bytes
+    $fatsize = align_up($fatsize, $balign) >> $secshift; # Sectors
+    $sectors += $nfats*$fatsize;
+
+    # Reserved sectors (in the FAT sense)
+    my $resv = 1;
+    $resv = $opt{strict}->{bootspace} ? 32 : 8 if ($fattype == 32);
+    $resv = 24 if ($exfat);
+    $resv = align_up($resv, $salign);
+    $sectors += $resv;
+
+    # The root directory for FAT12/16
+    my $rootdirsize;
+    if ($fattype < 32) {
+	$rootdirsize = $root->{size} + $res[2] * $dirbytesperfile;
+	if ($opt{strict}->{rootdir}) {
+	    $rootdirsize = max($rootdirsize, ($fattype < 16 ? 256 : 512) << 5);
+	}
+	$rootdirsize = align_up($rootdirsize, $balign);
+	$sectors += $rootdirsize >> $secshift;
+    }
+
+    # Crude attempt at geometry, in case someone actually that still cares...
+    my $chs = [];
+    my $chsec = $sectors + ($opt{part} == $FLAT ? 0 : $partalign);
+    my $floppy = $opt{part} == $FLAT && $chsec <= 10080 && !$exfat;
+    $chs->[1] = $opt{h} || ($floppy ? ($chsec < 512 ? 1 : 2) : 255);
+    $chs->[2] = $opt{s} ||
+	($floppy ? div_up($chsec, $chs->[1]*($chsec < 1024 ? 40 : 80)) : 63);
+    $chs->[0] = div_up($chsec, $chs->[1]*$chs->[2]);
+    $floppy = 0 if ($chs->[0] > 255);
+
+    # Suitable MBR type
+    my $mbrtype;
+    if ($opt{efi}) {
+	$mbrtype = 0xef;	# For MBR only, not PMBR
+    } elsif ($exfat) {
+	$mbrtype = 0x07;
+    } elsif ($fattype == 12) {
+	$mbrtype = 0x01;
+    } elsif ($fattype == 16) {
+	$mbrtype =
+	    $sectors < 0x10000 ? 0x04 : $chs->[0] <= 1024 ? 0x06 : 0x0e;
+    } else {
+	$mbrtype = 0x0c;
+    }
+
+    my $media = $floppy ? 0xf0 : 0xf8;
+    my $drive = $floppy ? 0x00 : 0x80;
+
+    # Generated filesystem image parameters. May be an overestimate.
+    return {
+	'root' => $root, 'rootdirsize' => $rootdirsize,
+	'bitmapclust' => $bitmapclust, 'exfat' => $exfat,
+	'upcase' => $upcase_table,
+	'sectors' => $sectors, 'cshift' => $cshift,
+	'csectors' => 1 << $cshift, 'cbytes' => $cbytes,
+	'cbshift' => $cbshift, 'fattype' => $fattype,
+	'resv' => $resv, 'nfats' => $nfats, 'fatsize' => $fatsize,
+	'clust' => $c, 'secshift' => $secshift, 'sector' => $sector,
+	'mbrtype' => $mbrtype, 'gpttype' => $gpt_types[!!$opt{efi}],
+	'partalign' => $partalign,
+	'chs' => $chs, 'media' => $media, 'drive' => $drive
+    };
+}
+
+# Update the format parameters after the disk layout is complete
+sub finalize_format_params($$$) {
+    my($root, $startsec, $fssec) = @_;
+    my $parm = $root->{parm};
+    $parm->{hidden}  = $startsec;
+
+    my $prefixsec = $parm->{resv} + $parm->{fatsize} * $parm->{nfats};
+    $prefixsec += div_up($parm->{rootdirsize}, $parm->{sector});
+
+    if ($parm->{exfat}) {
+	$root->{files}->{"\0\0bitmap"}->{exsize} = div_up($parm->{clust}, 8);
+	$root->{files}->{"\0\0upcase"}->{data} = ${$parm->{upcase}};
+    }
+
+    # Offset to the data area (cluster heap) in partition-relative
+    # sectors and in disk-absolute bytes (the latter to print messages)
+    $parm->{heap} = $prefixsec;
+    $parm->{dataoffset} = ($startsec + $prefixsec) << $parm->{secshift};
+
+    # Compute the final size of the filesystem
+    my $fattypemax = (1 << $parm->{fattype}) - 12;
+    my $fatsizemax = ($parm->{fatsize} << ($parm->{secshift} + 3))
+	/ $parm->{fattype};
+    my $spacemax = ($fssec - $prefixsec) >> $parm->{cshift};
+    my $clust = min($spacemax, $fattypemax, $fatsizemax);
+
+    if ($parm->{exfat}) {
+	my $bitmaskmax = $parm->{bitmapclust} << ($parm->{cbshift} + 3);
+	$clust = min($clust, $bitmaskmax);
+    }
+    $parm->{clust}   = $clust;
+    $parm->{sectors} = $prefixsec + ($clust << $parm->{cshift});
+}
+
+# This walks the *subnodes* of a node of a certain type
+sub populate_with($$$$);
+sub populate_with($$$$) {
+    my($dir, $parm, $type, $what) = @_;
+    my $ret = 0;
+
+    foreach my $de (@{$dir->{filelist}}) {
+	if ($de->{type} == $type) {
+	    $ret += $what->($de, $parm);
+	}
+	if ($de->{type} == $DIR) {
+	    $ret += populate_with($de, $parm, $type, $what);
+	}
+    }
+    return $ret;
+}
+
+# Assign cluster number to one file node
+sub assign_clust($) {
+    my($f) = @_;
+    my $root = $f->{root};
+    my $parm = $root->{parm};
+    my $size = $f->{size};
+
+    $size = $f->{exsize} if ($parm->{exfat} && defined($f->{exsize}));
+    $size = length($f->{data}) if (!defined($size) && defined($f->{data}));
+    $f->{size} = $size;
+
+    $f->{fatchain} = 1 unless ($parm->{exfat});
+
+    $f->{paddedsize} = align_up($f->{size}, $parm->{cbytes});
+    $f->{nclust} = $f->{paddedsize} >> $parm->{cbshift};
+    if (!$f->{nclust}) {
+	$f->{clustno} = 0;
+    } else {
+	my $clustno = $f->{clustno} = $parm->{endclust};
+	$parm->{endclust} += $f->{nclust};
+	push(@{$root->{layout}}, $f);
+	if ($opt{verbose} >= 3) {
+	    printf STDERR "%s: cluster %5d @ 0x%08x (len %5d) for \"%s\"\n",
+		$opt{outfile}, $clustno,
+		$parm->{dataoffset} + (($clustno-2) << $parm->{cbshift}),
+		$f->{nclust}, $f->{path} || '/';
+	}
+    }
+    return $f->{nclust};
+}
+
+# Assign final cluster numbers and padded sizes to files and directories
+sub assign_clusters($) {
+    my($root) = @_;
+    my $parm = $root->{parm};
+
+    $parm->{endclust} = 2;	# First real cluster
+    $root->{layout} = [];	# File nodes in layout order
+
+    populate_with($root, $parm, $EXFAT, \&assign_clust);
+    if ($parm->{rootdirsize}) {
+	# FAT12/16: root directory is special
+	$root->{clustno} = 0;
+	$root->{paddedsize} = $parm->{rootdirsize};
+	push(@{$root->{layout}}, $root);
+	if ($opt{verbose} >= 3) {
+	    printf STDERR "%s: root directory @ 0x%08x, %d sectors\n",
+		$opt{outfile}, $parm->{dataoffset} - $root->{paddedsize},
+		$root->{paddedsize} >> $parm->{secshift};
+	}
+    } else {
+	assign_clust($root);
+    }
+    populate_with($root, $parm, $DIR,   \&assign_clust);
+    populate_with($root, $parm, $FILE,  \&assign_clust);
+
+    if ($opt{verbose} >= 1) {
+	my $freeclust = $parm->{clust} - ($parm->{endclust}-2);
+	printf STDERR "%s: %d/%d clusters free (%dK)\n",
+	    $opt{outfile}, $freeclust, $parm->{clust},
+	    $freeclust << $parm->{cbshift} >> 10;
+    }
+    die if ($parm->{endclust} > $parm->{clust} + 2);
+
+    if ($parm->{exfat}) {
+	my $usedclust = $parm->{endclust} - 2;
+	my $bitmap = "\xff" x ($usedclust >> 3);
+	if ($usedclust & 7) {
+	    $bitmap .= pack('C', (1 << ($usedclust & 7))-1);
+	}
+	$bitmap .= "\0" x (div_up($parm->{clust}, 8) - length($bitmap));
+	$root->{files}->{"\0\0bitmap"}->{data} = $bitmap;
+    }
+}
+
+# Emit one FAT entry. $hold should be a reference to a scalar
+# used for the even-numbered (first) part of a FAT12 pair.
+# The number should be masked so that the special numbers at the end
+# of the number range can be represeented by -9 to -1.
+sub emit_fat12($$$) {
+    my($out, $num, $hold) = @_;
+
+    $num &= 0xfff;
+
+    if (!defined($$hold)) {
+	$$hold = $num;
+	return 0;
+    }
+
+    $num <<= 12;
+    $num |= $$hold;
+    undef($$hold);
+    return emit($out, pack('vC', $num & 0xffff, $num >> 16));
+}
+sub emit_fat16($$$) {
+    my($out, $num, $hold) = @_;
+    return emit($out, pack('v', $num & 0xffff));
+}
+sub emit_fat32($$$) {
+    my($out, $num, $hold) = @_;
+    return emit($out, pack('V', $num & 0x0fffffff));
+}
+sub emit_exfat($$$) {
+    my($out, $num, $hold) = @_;
+    return emit($out, pack('V', $num & 0xffffffff));
+}
+
+sub emit_one_fat($) {
+    my($root) = @_;
+    my $parm = $root->{parm};
+    my $out = $parm->{out};
+    my %emit_func = (
+	12 => \&emit_fat12,
+	16 => \&emit_fat16,
+	32 => \&emit_fat32
+    );
+    my $emit_fat = $parm->{exfat} ? \&emit_exfat : $emit_func{$parm->{fattype}};
+    my $hold;
+    my $bytes = 0;
+
+    # The two special entries at the start
+    $bytes += $emit_fat->($out, $parm->{media} - 256, \$hold);
+    $bytes += $emit_fat->($out, -1, \$hold);
+
+    my $clustno = 2;
+    foreach my $f (@{$root->{layout}}) {
+	next if (!$f->{clustno});		# No cluster chain
+	die if ($f->{clustno} != $clustno);	# This would be bad...
+	my $nclust = $f->{nclust};
+	my $mask = $f->{fatchain} ? -1 : 0;
+	while (--$nclust) {
+	    # Emit the *next* cluster number
+	    $bytes += $emit_fat->($out, (++$clustno) & $mask, \$hold);
+	}
+	$bytes += $emit_fat->($out, $mask, \$hold); # End of cluster chain
+	$clustno++;
+    }
+
+    # Flush any partial output
+    while (defined($hold)) {
+	$bytes += $emit_fat->($out, 0, \$hold);
+    }
+
+    $bytes += emit_zero($out, ($parm->{fatsize} << $parm->{secshift}) - $bytes);
+    return $bytes;
+}
+
+# Flush a file handle and die on errors
+sub fh_flush($) {
+    my($fh) = @_;
+    if ($fh->error || !$fh->flush || $fh->error) {
+	die "$opt{filename}: output write error: $!\n";
+    }
+}
+
+my $zerobuf;
+sub emit_flush_file($) {
+    my($out) = @_;
+    my $zeroes = $out->{zeroes};
+
+    return unless ($zeroes);
+
+    my $fh     = $out->{fh};
+    my $sparse = $out->{sparse};
+    my $fpos   = $out->{fpos};
+
+    if ($sparse) {
+	my $minsparse = $sparse + npad($fpos, $sparse);
+	if ($zeroes >= $minsparse) {
+	    fh_flush($fh);
+	    my $here = tell($fh);
+	    my $whereto = $here + $zeroes;
+	    if ($here == $fpos && truncate($fh, $whereto) &&
+		seek($fh, $whereto, SEEK_SET)) {
+		if ($opt{verbose} >= 4) {
+		    printf STDERR "%s: skipped %d (0x%x) bytes from %d (0x%x) to %d (0x%x)\n",
+			$opt{outfile}, $zeroes, $zeroes, $here, $here, $whereto, $whereto;
+		}
+		$zeroes = 0;
+		$fpos = $whereto;
+	    } else {
+		# Sparsification failed
+		seek($fh, $fpos, SEEK_SET); # Try to undo
+		$out->{sparse} = 0;
+	    }
+	}
+    }
+    while ($zeroes > 0) {
+	my $chunk = min($zeroes, length($zerobuf));
+	print $fh substr($zerobuf, 0, $chunk);
+	$zeroes -= $chunk;
+	$fpos   += $chunk;
+    }
+
+    die if ($zeroes);
+    $out->{zeroes} = 0;
+    $out->{fpos}   = $fpos;
+}
+
+my $sparse_regex;
+sub set_sparse($$) {
+    my($out,$sparse) = @_;
+    # Perl has a built-in limit on the length of a regex range,
+    # but it isn't easily discoverable. Use a string eval (*not*
+    # a block eval!) to trap the error and reduce the value if
+    # necessary. On most versions of Perl this is a number of the
+    # form 2^n - 2, so easy to check that way.
+    #
+    # The purpose of the regular expression is to optimize the handling
+    # of strings with runs of zeroes smaller than the sparse limit;
+    # making the threshold smaller just means some minor additional
+    # processing time.
+    for (my $resparse = $sparse; $resparse > 1; $resparse >>= 1) {
+	my $unsparse = ($resparse-1) & ~1;
+	my $re = eval 'qr/^((\0*)([^\0]+(?:\0{,'.$unsparse.'}[^\0]+)*)?)(.*)$/s';
+	if ($re) {
+	    $out->{sparse_regex} = $re;
+	    return $out->{sparse} = $sparse;
+	}
+    }
+    return $out->{sparse} = 0;
+}
+
+sub emit_to_file($$) {
+    my($out,$s) = @_;
+    my $fh       = $out->{fh};
+
+    while (length($s)) {
+	my $sparse   = $out->{sparse};
+	my $zeroes   = $out->{zeroes};
+	my $ns;
+
+	if ($sparse && $s =~ $out->{sparse_regex}) {
+	    $s = $4;
+	    my $zl = $zeroes + length($2);
+	    if (!length($3) || $zl >= $sparse) {
+		$out->{zeroes} = $zeroes = $zl;
+		$ns = $3;
+	    } else {
+		$ns = $1;
+	    }
+	} else {
+	    $ns = $s;
+	    undef $s;
+	}
+
+	if (my $dl = length($ns)) {
+	    emit_flush_file($out) if ($zeroes);
+	    print $fh $ns;
+	    $out->{fpos} += $dl;
+	}
+    }
+}
+sub emit_to_hash($$) {
+    my($out,$s) = @_;
+    $out->{hash}->add($s);
+}
+
+sub emit($@) {
+    my $out = shift(@_);
+    my $emitfunc = $out->{emitfunc};
+    my $bytes = 0;
+
+    foreach my $s (@_) {
+	my $len = length($s);
+	if ($len) {
+	    $emitfunc->($out, $s);
+	    $bytes += $len;
+	}
+    }
+    $out->{bytes} += $bytes;
+    return $bytes;
+}
+sub emit_flush($) {
+    my($out) = @_;
+    my $flushfunc = $out->{flushfunc};
+    $flushfunc->($out) if ($flushfunc);
+}
+sub emit_zero($$) {
+    my($out, $count) = @_;
+
+    if ($out->{sparse}) {
+	$count = untaint_uint($count);
+	$out->{zeroes} += $count;
+	$out->{bytes}  += $count;
+	return $count;
+    } else {
+	my $bytes = 0;
+	while ($count > $bytes) {
+	    my $chunk = min(length($zerobuf), $count - $bytes);
+	    $bytes += emit($out, substr($zerobuf, 0, $chunk));
+	}
+	return $bytes;
+    }
+}
+
+sub dosdate {
+    my($time, $tz) = @_;
+    if (!defined($tz)) {
+	if ($opt{utc}) {
+	    $tz = 0;
+	} else {
+	    my @lt = localtime($time);
+	    my @gt = gmtime($time);
+	    $tz = ($lt[0] - $gt[0]) + ($lt[1] - $gt[1]) * 60 +
+		($lt[2] - $gt[2]) * 3600;
+	    if ($lt[5] < $gt[5] || $lt[4] < $gt[4] || $lt[3] < $gt[3]) {
+		$tz -= 86400;
+	    } elsif ($lt[5] > $gt[5] || $lt[4] > $gt[4] || $lt[3] > $gt[3]) {
+		$tz += 86400;
+	    }
+	}
+    }
+    my @lt = gmtime($time+$tz);
+
+    $lt[5] -= 80;		# Convert year to 1980-based
+    $lt[4] += 1;		# Convert month to 1-based
+    if ($lt[5] < 0) {
+	@lt = (0, 0, 0, 1, 1, 0);
+    } elsif ($lt[5] > 127) {
+	@lt = (59, 59, 23, 31, 12, 127);
+    }
+
+    $tz = $tz < 0 ? max($tz+114749, 57600) : min($tz+450, 57599);
+    $tz = ($tz/900) + 0x80;
+
+    return [($lt[5] << 25) + ($lt[4] << 21) + ($lt[3] << 16) +
+	    ($lt[2] << 11) + ($lt[1] << 5) + ($lt[0] >> 1),
+	    ($lt[0] & 1) ? 100 : 0, $tz, $time];
+}
+
+sub dir_shortent($$$$$) {
+    my($name, $attr, $date, $clustno, $size) = @_;
+
+    $size = 0 if ($attr & ($DIR|$VOL));
+    return pack('A11CCCVvvVvV', $name, $attr, 0, 0,
+		$date->[0], $date->[0] >> 16, $clustno >> 16,
+		$date->[0], $clustno & 0xffff, $size);
+}
+
+sub fat_csum($$) {
+    my($s,$bits) = @_;
+    my $csum = 0;
+    my $shift = $bits-1;
+    my $mask = (1 << $bits) - 1;
+    foreach my $b (unpack('C*', $s)) {
+	$csum = ((($csum & 1) << $shift) + ($csum >> 1) + $b) & $mask;
+    }
+    return $csum;
+}
+
+sub direntry_fat($$) {
+    my($f) = @_;
+    my $type = $f->{type};
+    return undef if ($type & $EXFAT);
+
+    my $shortent = dir_shortent($f->{shortname}, $f->{attr}, $f->{date},
+				$f->{clustno}, $f->{size});
+    my $namesum = fat_csum(substr($shortent, 0, 11), 8);
+
+    my $longname = $f->{longname} . pack('v*', 0, (0xffff) x 11);
+    my $longpos = length($longname);
+    $longpos -= $longpos % 26;
+    my $longctr = ($longpos/26) | 0x40;
+    my $ent;
+    while ($longctr) {
+	$longpos -= 26;
+	$ent .= pack('Ca10CCCa12va4', $longctr,
+		     substr($longname, $longpos, 10),
+		     $LONGNAME, 0, $namesum,
+		     substr($longname, $longpos+10, 12),
+		     0,
+		     substr($longname, $longpos+22, 4));
+	$longctr = ($longctr & 0x3f) - 1;
+    }
+    $ent .= $shortent;
+    return $ent;
+}
+
+sub direntry_exfat($) {
+    my($f) = @_;
+    my $ent;
+    my $do_checksum = 1;
+
+    if ($f->{type} == $EXFAT) {
+	my $extype = $f->{extype};
+	if ($extype == $EXFAT_VOLID) {
+	    $ent .= pack('CCva16a10', $extype, 0, $f->{root}->{volid}, '');
+	} elsif ($extype == $EXFAT_BITMAP) {
+	    $ent .= pack('CC@20VQ<', $extype, 0, $f->{clustno}, $f->{size});
+	    $do_checksum = 0;
+	} elsif ($extype == $EXFAT_UPCASE) {
+	    $ent .= pack('C@4V@20VQ<', $extype, fat_csum($f->{data},32),
+			 $f->{clustno}, $f->{size});
+	    $do_checksum = 0;
+	} else {
+	    die;
+	}
+    } elsif ($f->{type} == $VOL) {
+	$ent = pack('CCa22a8',
+		    $EXFAT_VOL,
+		    min(length($f->{longname}) >> 1, 11),
+		    $f->{longname}, '');
+    } else {
+	my $longname = $f->{longname};
+	my $tz = ((($f->{tz}/900) << 2) & 0x7f) | 0x80;
+	my $datetime = $opt{date} || dosdate($f->{date});
+	my $size = ($f->{type} & $DIR) ? $f->{paddedsize} : $f->{size};
+	$ent = pack('CCvvV3C5a7',
+		    $EXFAT_FILE, div_up(length($longname), 30)+1,
+		    $f->{attr}, 0, ($datetime->[0]) x 3,
+		    ($datetime->[1]) x 2, ($datetime->[2]) x 3, '');
+
+	my $allocflags = $f->{size} ? ($f->{fatchain} ? 0x01 : 0x03) : 0x00;
+
+	$ent .= pack('CCCCvvQ<VVQ<',
+		     $EXFAT_STREAM, $allocflags, 0, length($longname) >> 1,
+		     fat_csum(upcase_longname($longname),16), 0,
+		     $size, 0, $f->{clustno}, $size);
+
+	for (my $p = 0; $p < length($longname); $p += 30) {
+	    $ent .= pack('CCa30', $EXFAT_NAME, 0, substr($longname, $p, 30));
+	}
+    }
+    substr($ent,2,0) = pack('v', fat_csum($ent,16)) if ($do_checksum);
+    return $ent;
+}
+
+# Emit the contents of a directory
+sub emit_dir {
+    my($dir, $parm) = @_;
+    my $out = $parm->{out};
+    my $exfat = $parm->{exfat};
+    my $mkent = $exfat ? \&direntry_exfat : \&direntry_fat;
+    my $preent;
+
+    if (!$exfat && (my $up = $dir->{up})) {
+	# Not the root directory, emit . and ..
+	my $dirdate = $dir->{date};
+	$dir->{date} = node_date($dir) unless ($dirdate);
+	$preent = dir_shortent('.',  $DIR, $dirdate, $dir->{clustno}, 0);
+
+	# For some stupid reason .. is supposed to have 0 in the cluster
+	# pointer when it points to the root directory even on FAT32...
+	my $upptr = $up->{up} ? $up->{clustno} : 0;
+	$preent .= dir_shortent('..', $DIR, $dirdate, $upptr,  0);
+    }
+
+    # The regular directory entry list, already sorted
+    my $bytes = emit($out, $preent, map { $mkent->($_) } @{$dir->{filelist}});
+
+    if ($bytes != $dir->{size}) {
+	die "$bytes != $dir->{size}, fh = $out->{fh}";
+    }
+    $bytes += emit_zero($out, $dir->{paddedsize} - $bytes);
+    return $bytes;
+}
+
+# Copy the contents of a file
+sub emit_file {
+    my($f, $parm) = @_;
+    my $bytes = 0;
+    my $size = $f->{size};
+
+    return if (!$size);		# Empty file
+
+    my $out = $parm->{out};
+
+    if ($f->{populate}) {
+	$bytes = $f->{populate}->($f, $parm, $out);
+    } elsif (defined($f->{data})) {
+	$bytes = emit($out, $f->{data});
+    } elsif (defined($f->{inpath})) {
+	my $in;
+	if (open($in, '<', $f->{inpath})) {
+	    binmode($in);
+	    while ($bytes < $size) {
+		my $buf;
+		my $chunk = min($size - $bytes, $out->{iosize});
+		last if (!read($in, $buf, $chunk));
+		$bytes += emit($out, $buf);
+	    }
+	    close($in);
+	}
+	if ($bytes < $size) {
+	    print STDERR "%s: %s: %s\n", $opt{outfile}, $f->{inpath}, $!;
+	    $err++;
+	    $size = $bytes;	# Avoid redundant error messages
+	}
+    }
+
+    if ($bytes != $size) {
+	print STDERR "%s: %s: file size changed during processing\n",
+	    $opt{outfile}, $f->{path};
+	$err++;
+    }
+    $bytes += emit_zero($out, $f->{paddedsize} - $bytes);
+    return $bytes;
+}
+
+# Generate the FAT superblock
+sub emit_superblock_fat($$) {
+    my($root, $parm) = @_;
+    my $fat = $parm->{fattype};
+
+    my $sec32 = $parm->{sectors};
+    my $sec16 = ($fat < 32 && $sec32 <= 0xffff) ? $sec32 : 0;
+
+    my $bs = pack('a3A8vCvCvvCvvvVV',
+		  $KILLJMP, $opt{creator},
+		  $parm->{sector},
+		  $parm->{csectors}, $parm->{resv}, $parm->{nfats},
+		  $root->{clustno} ? 0 : $root->{paddedsize} >> 5,
+		  $sec16, $parm->{media},
+		  $fat < 32 ? $parm->{fatsize} : 0,
+		  $parm->{chs}->[2], $parm->{chs}->[1],
+		  $parm->{hidden}, $sec32);
+    my $backupsb = 6;
+
+    if ($fat >= 32) {
+	# Weirdly injected in the middle of the FAT12/16 boot sector
+	$bs .= pack('VvvVvva12', $parm->{fatsize}, 0, 0x0000,
+		    $root->{clustno}, 1, $backupsb, '');
+    }
+
+    $bs .= pack('CCCa4A11A8.a*.v', $parm->{drive}, 0, 0x29, $root->{volid},
+		$root->{vollbl}->{shortname}, "FAT$fat",
+		$KILLOFFS - length($bs), $KILLBOOT,
+		510 - length($bs), 0xaa55);
+
+    my $out = $parm->{out};
+    my $bytes = emit($out, $bs);
+
+    if ($fat >= 32) {
+	my $fsinfo = pack('A4a480A4VVa12V',
+			  'RRaA', '', 'rrAa',
+			  $parm->{clust} - $parm->{endclust} + 2,
+			  $parm->{endclust},
+			  '', 0xaa550000);
+	$bytes += emit($out, $fsinfo);
+	$bytes += emit_zero($out, ($backupsb - 2) << 9);
+	$bytes += emit($out, $bs, $fsinfo);
+    }
+    $bytes += emit_zero($out, ($parm->{resv} << $parm->{secshift}) - $bytes);
+    return $bytes;
+}
+
+# Generate exFAT superblock
+sub emit_superblock_exfat($$) {
+    my($root, $parm) = @_;
+
+    # The use of {fssec} (partition size) rather than {sectors}
+    # (sectors actually used by the filesystem) here is intentional
+    # and required. The checksum is calculated on a string which does
+    # not include the VolumeFlags and PercentInUse fields *at all*,
+    # as opposed to as zeroes, hence the odd -3 offsets below.
+    my $bs = pack('a3A8@64Q<Q<V5a4vC4@507v.',
+		  $KILLJMP, 'EXFAT', $parm->{hidden}, $parm->{disk}->{fssec},
+		  $parm->{resv}, $parm->{fatsize}, $parm->{heap},
+		  $parm->{clust}, $root->{clustno}, $root->{volid},
+		  0x0100, $parm->{secshift}, $parm->{cshift},
+		  $parm->{nfats}, $parm->{drive}, 0xaa55, $parm->{sector}-3);
+    substr($bs, $KILLOFFS-3, length($KILLBOOT)) = $KILLBOOT;
+    $bs .= pack('.V', $parm->{sector}-4, 0xaa550000) x 8;
+    $bs .= pack('.', 2*$parm->{sector});
+
+    my $checksum = fat_csum($bs, 32);
+    $bs .= pack('V', $checksum) x ($parm->{sector} >> 2);
+    # Insert the non-checksummed fields
+    substr($bs, 106, 0) = pack('v', 0);
+    substr($bs, 112, 0) = pack('C', (($parm->{endclust}-2)*100)/$parm->{clust});
+    return emit($parm->{out}, $bs, $bs);
+}
+
+sub emit_superblock($$) {
+    my($root, $parm) = @_;
+
+    if ($parm->{exfat}) {
+	return emit_superblock_exfat($root, $parm);
+    } else {
+	return emit_superblock_fat($root, $parm);
+    }
+}
+
+# Create long and short volume labels.
+sub create_vol_label($) {
+    my($root) = @_;
+
+    my $vol = $opt{volname};
+    $vol = 'EFI BOOT' if ($vol eq '' && $opt{efi});
+    $vol = decode_utf8($vol);
+    # Per Microsoft: volumne names are 11 characters max even in Unicode
+    my $longname = substr(to_uni($vol), 0, 11 << 1);
+    $root->{vollbl} = {	'name' => $vol, 'longname' => $longname,
+			'path' => '<vol>', 'up' => $root, 'root' => $root };
+    if ($vol ne '') {
+	set_node_type($root->{files}->{"\0\0vol"} = $root->{vollbl}, $VOL);
+    } else {
+	$root->{vollbl}->{shortname} = 'NO NAME'; # By spec
+    }
+}
+
+# Set disk, partition, and volume identifiers
+sub set_identifiers($) {
+    my($root) = @_;
+    my $parm = $root->{parm};
+
+    $root->{diskid} = parse_guid($opt{diskid});
+    $root->{partid} = parse_guid($opt{partid});
+    $root->{volid}  = parse_guid($opt{volid});
+
+    if ($opt{verbose} >= 1) {
+	my $vol = $root->{vollbl}->{name};
+	my $vostr = sprintf('%04X-%04X',reverse unpack('v*', $root->{volid}));
+	if ($parm->{part} != $FLAT) {
+	    print STDERR "$opt{outfile}: diskid ",
+		guid_str($root->{diskid}, $root->{part} == $MBR), "\n";
+	    if ($parm->{part} == $GPT) {
+		print STDERR "$opt{outfile}: partid ",
+		    guid_str($root->{partid}), "\n";
+	    }
+	}
+	printf STDERR "%s: volid  %s\n", $opt{outfile},
+	    guid_str($root->{volid}, !$parm->{exfat});
+	printf STDERR "%s: label  %s\n", $opt{outfile},
+	    $vol eq '' ? 'none' : "\"$vol\"";
+    }
+}
+
+sub create_layout($) {
+    my($root) = @_;
+
+    # Compute a suitable cluster shift.
+    my $parm = undef;
+    if ($opt{exfat} < 2 && !$root->{largefile}) {
+	for (my $cs = 0; $cs < 7; $cs++) {
+	    my $thisparm = get_format_params($root, $cs, 0);
+	    next unless (defined($thisparm));
+	    if ($opt{verbose} >= 3) {
+		printf STDERR "trial: FAT%d, clust %6d: sectors %8d, clusters %8d\n",
+		    $thisparm->{fattype}, 1 << $cs, $thisparm->{sectors},
+		    $thisparm->{clust};
+	    }
+	    if (!defined($parm) || ($thisparm->{sectors} < $parm->{sectors})) {
+		$parm = $thisparm;
+	    }
+	    # Avoid 128-sector clusters unless we really need them
+	    last if (defined($parm) && $cs >= 6);
+	}
+    }
+    if ($opt{exfat}) {
+	for (my $cs = 0; $cs < 18; $cs++) {
+	    my $thisparm = get_format_params($root, $cs, 1);
+	    next unless (defined($thisparm));
+	    if ($opt{verbose} >= 3) {
+		printf STDERR "trial: exFAT, clust %6d: sectors %8d, clusters %8d\n",
+		    1 << $cs, $thisparm->{sectors}, $thisparm->{clust};
+	    }
+	    if (!defined($parm) || ($thisparm->{sectors} < $parm->{sectors})) {
+		$parm = $thisparm;
+	    }
+	}
+    }
+
+    die "$opt{outfile}: unable to create a valid filesystem (too large?)\n"
+	unless (defined($parm));
+    $root->{parm} = $parm;
+
+    # Cluster bytes
+    my $csectors = $parm->{csectors};
+
+    # Block alignment in sectors
+    my $align     = $parm->{partalign};
+    my $gptsize   = div_up(max($opt{gptent},
+			       $opt{strict}->{gptsize} ? 128 : 1),
+			   $parm->{sector} >> 7);
+    my $startsec  = 0;
+    my $endsec    = 0;
+    my $sectors   = $parm->{sectors};
+    $parm->{part} = $opt{part};
+    if ($parm->{part} == $ANYPART) {
+	$parm->{part} =
+	    $opt{efi} || ($sectors+$align) > 0xffffffff ? $GPT : $MBR;
+    }
+    if ($parm->{part} == $GPT) {
+	$startsec   = $gptsize + 2; # +2 for PMBR, header
+	if ($opt{backup_gpt}) {
+	    $endsec   = $gptsize + 1;
+	    $opt{pad} = 1;	# Padding to end of "disk" required
+	}
+    } elsif ($parm->{part} == $MBR) {
+	$startsec = 1;
+    } else {
+	$parm->{part} = $FLAT;
+    }
+    # Initial partition table + alignment + space for backup gpt if necessary
+    $startsec  = align_up($startsec, $align);
+    $sectors   = align_up($sectors + $startsec + $endsec, $align);
+    $endsec    = $sectors - $endsec;
+    my $fssec  = $endsec  - $startsec;
+    $parm->{disk} = {
+	'align'    => $align,
+	'startsec' => $startsec,
+	'endsec'   => $endsec,
+	'fssec'    => $fssec,
+	'gptsize'  => $gptsize,
+	'sectors'  => $sectors
+    };
+
+    # Update with the actually generated layout
+    finalize_format_params($root, $startsec, $fssec);
+    if ($opt{verbose} >= 1) {
+	printf STDERR "%s: %s, %d clusters * %d bytes\n",
+	    $opt{outfile}, $parm->{exfat} ? 'exFAT' : 'FAT'.$parm->{fattype},
+	    $parm->{clust}, $parm->{cbytes};
+	printf STDERR "%s: image size is %d bytes\n",
+	    $opt{outfile}, $sectors << $parm->{secshift};
+
+	if ($opt{verbose} >= 2) {
+	    printf STDERR "%s: partition is %d sectors, image %d sectors\n",
+		$opt{outfile}, $fssec, $sectors;
+	    printf STDERR "%s: filesystem @ 0x%08x, data @ 0x%08x\n",
+		$opt{outfile}, $startsec << $parm->{secshift},
+		$parm->{dataoffset};
+	}
+    }
+    assign_clusters($root);
+    print $startsec << $parm->{secshift}, "\n" if ($opt{print_offset});
+}
+
+sub emit_image($$) {
+    my($root, $out) = @_;
+    my $parm = $root->{parm};
+    my $disk = $parm->{disk};
+
+    $zerobuf = pack('.', $out->{iosize});
+    $parm->{out}  = $out;
+
+    # Create the partition table
+    my @part; # MBR, GPT header, GPT array, backup GPT header
+    if ($parm->{part} == $GPT) {
+	@part = gen_gpt($disk->{sectors}, $disk->{startsec},
+			$disk->{fssec}, $parm->{gpttype},
+			$disk->{gptsize}, $root->{vollbl}->{name},
+			$root->{diskid}, $root->{partid}, $parm->{chs});
+    } elsif ($parm->{part} == $MBR) {
+	$part[0] = gen_mbr($disk->{startsec}, $disk->{fssec},
+			   $parm->{mbrtype}, $parm->{chs},
+			   $parm->{active}, $root->{diskid});
+    }
+
+    my $bytes = emit($out, @part[0 ... 2]);
+    $bytes += emit_zero($out,
+			($disk->{startsec} << $parm->{secshift}) - $bytes);
+
+    die unless ($bytes == ($disk->{startsec} << $parm->{secshift}));
+
+    # The boot sector/superblock
+    $bytes += emit_superblock($root, $parm);
+
+    # The FATs
+    for (my $i = 0; $i < $parm->{nfats}; $i++) {
+	$bytes += emit_one_fat($root);
+    }
+
+    # Special entries, root directory, subdirectories, files
+    if ($parm->{exfat}) {
+	$bytes += populate_with($root, $parm, $EXFAT, \&emit_file);
+    }
+    $bytes += emit_dir($root, $parm);
+    $bytes += populate_with($root, $parm, $DIR,   \&emit_dir);
+    $bytes += populate_with($root, $parm, $FILE,  \&emit_file);
+
+    # Finally, pad the image and output the backup GPT if there is one
+    # This does not need to be included when hashing, so...
+    if ($opt{pad} && $out->{fh}) {
+	$bytes += emit_zero($out,
+			    ($disk->{endsec} << $parm->{secshift}) - $bytes);
+	$bytes += emit($out, @part[2 ... 3]) if (defined($part[3]));
+	die unless ($bytes == ($disk->{sectors} << $parm->{secshift}));
+    }
+    emit_flush($out);
+    return $bytes;
+}
+
+sub usage(;$) {
+    my($err) = @_;
+    my $out = $err ? \*STDERR : \*STDOUT;
+    print $out <<EOF;
+$myname $myversion
+Usage: $myname [options] -o outfile [--] [[[destination]:]:]input_path...
+
+Create and populate a FAT filesystem image. By default it tries to
+minimize the image as much as possible, leaving no free space and
+minimizing all data structures to the smallest possible.
+
+Inputs can be files or directories. By default, if the input is a
+directory, its input_path will be discarded entirely and the contents
+of that directory will be added to the root directory; if the input is
+a file, the input filename will be used as its name and the file is
+added to the root directory.
+
+Pathnames that are invalid in FAT are converted unless
+--strict=filename is in use.
+
+The prefix \"destination::\" specifies that an input should be located
+at a certain destination path in the generated image. If the
+destination ends in \"/\", the input file name or last level directory
+name will be appended to the destination path.
+
+A prefix of \":\" is equivalent to no prefix at all. This is
+recommended if input_path may contain \"::\".
+
+A prefix of \"::\" alone as that the entire input_path should be used
+as the destination name.
+
+Most options can be negated by prefixing their long forms with --no-.
+
+Options:
+-o, --output             Specify the output file - REQUIRED (use - for stdout)
+    --flat, --floppy     Do not create a partition table
+    --part               Create a partion table, either MBR or GPT [default]
+    --mbr                Create an MBR partition table
+    --gpt[=<partitions>] Create a GPT partition table [default with --efi]
+-e ,--efi, --uefi        Mark the partition as an EFI system partition
+-b, --boot, --active     Make the partition BIOS bootable
+-L, --label=<name>       Set the filesystem volume and GPT partition name
+-H, --heads=#            Define heads per cylinder for legacy geometry [255]
+-S, --secpertrack=#      Define sectors per track legacy geometry [63]
+-v, --verbose[=#]        Set message verbosity [0]
+-q, --quiet              Suppress all messages except fatal errors
+-r, --readonly           Set the readonly flag on every file
+-w, --writable           Never set the readonly flag (alias for --no-readonly)
+    --archive            Set the archive flag on every file
+-R, --reserve=<files>,<bytes>,<rootfiles>,<namelen>
+                         Specify additional space to reserve in the filesystem
+             files:      Specify the minimum number of (small) new files [0]
+             bytes:      Specify additional bytes of free space [0]
+             rootfiles:  Indicate how may of <files> may be in / [0]
+             namelen:    Assumed maximum filename length for new files [64]
+-m, --media              Settings suitable for writing to physical media
+-s, --strict             Strictly adhere to recommended filesystem parameters
+    --strict=...         Fine grained control of strictness flags
+    --strict=help        Show detailed help about the --strict option
+-x, --exfat              Generate an exFAT filesystem if advantageous
+-X, --exfat=force        Unconditionally generate an exFAT filesystem
+-a, --align              Align data structures to multiples of the cluster size
+    --no-pad             Do not write out empty sectors at the end of the image
+    --no-backup-gpt      Omit the end-of-image backup GPT partition table
+    --random             Use random IDs by default instead of a repeatable hash
+    --volid=<id>         Set the volume ID to <id> (exFAT: GUID, FAT: 8 hex)
+    --partid=<id>        Set the partition ID to <id> (GPT only: GUID)
+    --diskid=<id>        Set the disk ID to <id> (GPT: GUID, MBR: 8 hex)
+-U, --utc                Create time stamps in UTC, not local time
+-D, --date=<date>        Force the time stamp of all files to <date>
+-C, --creator=<name>     Set the filesystem creator name to <name> [$mycreator]
+    --sparse[=<chunk>]   Try to create a sparse output file (default)
+    --print-offset       Print filesystem offset in the image after completion
+    --keep               Do not delete the output file even if an error occurs
+-V, --version            Display the version information
+-h, --help               Display this help text
+EOF
+    exit($err);
+}
+sub strict_help($) {
+    my($err) = @_;
+    my $out = $err ? \*STDERR : \*STDOUT;
+
+    print $out <<EOF;
+--strict option syntax: --strict=[+-]flag[,flag...]
+
+If preceeded by +, add to existing flags.
+If preceeded by -, remove from existing flags.
+
+--strict without any argument is equivalent to --strict=all, which sets
+all flags.
+
+For forward compatibility reasons, unknown flags are ignored unless
+--strict=flags is specified.
+
+Available flags are:
+EOF
+
+    map { printf $out "    --strict=%-10s %s\n", $_, $strict_help{$_} }
+	sort(keys(%strict_help));
+    exit($err);
+}
+
+sub get_arg($$;$) {
+    my($args,$os,$truth) = @_;
+
+    return undef if (defined($truth) && !$truth);
+    return $1 if ($os =~ /^-.*?=(.*)$/);	# = separated argument
+    return undef if ($truth < 0);		# Missing optional argument
+    my $arg = shift(@$args);
+    die "$myname: option -$os requires an argument\n" if (!defined($arg));
+    return $arg;
+}
+sub get_arg_uints($$;$$) {
+    my($args,$os,$truth,$cmax) = @_;
+
+    my $arg = get_arg($args, $os, $truth);
+    return () unless ($arg ne '');
+
+    my @ns;
+    foreach my $a (split(/,/, $arg)) {
+	if ($a =~ /^\s*(0x[0-9a-f]|[0-9]+)\s*([kmgtpe])?\s*$/i) {
+	    my $suf = lc($2);
+	    my $n = $1;
+	    $n = hex($n) if ($n =~ /^0x/i);
+	    push(@ns, $n << (10 * index(' kmgtpe', $suf)));
+	} else {
+	    undef @ns;
+	    last;
+	}
+    }
+    if (!@ns || scalar(@ns) > max($cmax,1)) {
+	die "$myname: invalid argument to -$os: $arg\n";
+    }
+    return \@ns;
+}
+sub get_arg_uint($$;$) {
+    my($args,$os,$truth) = @_;
+    my $ns = get_arg_uints($args, $os, $truth);
+    return $ns ? $ns->[0] : undef;
+}
+
+sub do_options($@) {
+    my $args = shift(@_);	# Argument list pointer
+
+    foreach my $optn (@_) {
+	my $os = $optn;
+	my $truth = ($os !~ s/^-no-?([^=]+)$/-$1/);
+
+	if ($os =~ /^(?:o|-output)(?:=.*)?$/) {
+	    $opt{outfile} = get_arg($args, $os, $truth);
+	} elsif ($os =~ /^(?:e|-efi|-uefi)$/) {
+	    $opt{efi} = $truth;
+	} elsif ($os =~ /^(?:g|-gpt)(=(\d+))$/) {
+	    if ($truth) {
+		$opt{part} = $GPT;
+		$opt{gptent} = $2+0 if ($1);
+	    } else {
+		$opt{part} = $FLAT unless ($opt{part} == $MBR);
+	    }
+	} elsif ($os =~ /^(?:b|-active|-(?:legacy-?)?boot(?:able)?)$/) {
+	    $opt{active} = $truth;
+	} elsif ($os =~ /^(?:m|-mbr)$/) {
+	    if ($truth) {
+		$opt{part} = $MBR;
+	    } else {
+		$opt{part} = $FLAT unless ($opt{part} == $GPT);
+	    }
+	} elsif ($os =~ /^(?:-flat|-floppy)$/) {
+	    if ($truth) {
+		$opt{part} = $FLAT;
+	    } else {
+		$opt{part} = $ANYPART if ($opt{part} == $FLAT);
+	    }
+	} elsif ($os =~ /^(?:p|-part)$/) {
+	    if ($truth) {
+		$opt{part} = $ANYPART unless ($opt{part} > $FLAT);
+	    } else {
+		$opt{part} = $FLAT;
+	    }
+	} elsif ($os =~ /^(?:R|-reserve)(?:=.*)?$/) {
+	    $opt{reserve} = get_arg_uints($args,$os,$truth,4);
+	} elsif ($os =~ /^(?:(r|-read-?only)|w|-writable|-read-?write)$/) {
+	    $opt{readonly} = ($1 ne '') ? $truth : !$truth;
+	} elsif ($os =~ /^(?:-archive)?$/) {
+	    $opt{archive} = $truth;
+	} elsif ($os =~ /^(?:-random)$/) {
+	    $opt{random} = $truth;
+	} elsif ($os =~ /^(?:v|-verbose)(=(\d+))?$/) {
+	    $opt{verbose} = !$truth ? 0 : $1 ? $2+0 : max($opt{verbose}+1, 1);
+	} elsif ($os =~ /^(?:q|-quiet)$/) {
+	    $opt{verbose} = $truth ? -1 : max($opt{verbose}, 0);
+	} elsif ($os =~ /^(?:H|-heads)(?:=.*)?$/) {
+	    $opt{h} = get_arg_uint($args,$os,$truth);
+	} elsif ($os =~ /^(?:S|-secpertrack)(?:=.*)?$/) {
+	    $opt{s} = get_arg_uint($args,$os,$truth);
+	} elsif ($os =~ /^(?:L|n|-label|-name|-volume(?:-?name)?)(?:=.*)?$/) {
+	    $opt{volname} = get_arg($args,$os,$truth) . '';
+	} elsif ($os =~ /^(?:s|-strict)(=([+-]?)(.*))?$/) {
+	    my $flags = $3;
+	    my $sense = $2;
+	    strict_help(0) if ($flags eq 'help');
+	    $truth = 0 if ($sense eq '-' || $flags =~ /^(?:no|none|off|0)$/);
+	    $opt{strict} = {} if (!$sense); # Clear all flags
+	    if ($flags =~ /^(?:no|none|off|0|yes|all|1)$/) {
+		$flags = join(',', keys(%strict_help));
+	    }
+	    my $found_unknown;
+	    foreach my $flag (split(/,/, $flags)) {
+		$found_unknown = $flag if (!$strict_help{$flag});
+		$opt{strict}->{$flag} = $truth;
+	    }
+	    if (defined($found_unknown) && $truth && $opt{strict}->{flags}) {
+		print STDERR "$myname: invalid --strict flag: $found_unknown\n";
+		strict_help(1);
+	    }
+	} elsif ($os =~ /^(?:a|-align)$/) {
+	    $opt{align} = $truth;
+	} elsif ($os =~ /^(?:-keep)$/) {
+	    $opt{keep} = $truth;
+	} elsif ($os eq '-pad') {
+	    $opt{pad} = $truth;
+	} elsif ($os =~ /^(?:([Xx])|-exfat)(?:=(.*))?$/) {
+	    my($xx,$oo) = ($1,$2);
+	    $truth = 0 if ($oo =~ /^(?:no|never|off|0)$/);
+	    $truth = 2 if ($xx eq 'X' || $oo =~ /^(?:force|always|1)$/);
+	    $opt{exfat} = $truth;
+	} elsif ($os =~ /^(?:m|-media)$/) {
+	    $opt{media} = $truth;
+	} elsif ($os =~ /^-diskid(?:=.*)?$/) {
+	    $opt{diskid} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^-partid(?:=.*)?$/) {
+	    $opt{partid} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^-volid(?:=.*)?$/) {
+	    $opt{volid} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^(?:C|-creator)(?:=.*)?$/) {
+	    $opt{creator} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^(?:D|-date(?:time)?)(?:=.*)?$/) {
+	    $opt{date} = get_arg($args,$os,$truth);
+	} elsif ($os =~ /^(?:U|-utc|-gmt)$/) {
+	    $opt{utc} = $truth;
+	} elsif ($os =~ /^-print-?offset$/) {
+	    $opt{print_offset} = $truth;
+	} elsif ($os =~ /^-sparse(?:=.*)?$/) {
+	    if ($truth) {
+		my $chunk = get_arg_uint($args,$os,-1);
+		$opt{sparse} = defined($chunk) ? $chunk : 1;
+	    } else {
+		$opt{sparse} = 0;
+	    }
+	} elsif ($os =~ /^(?:h|-help)$/) {
+	    usage(0);
+	} elsif ($os =~ /^(?:V|-version)$/) {
+	    print "$myname $myversion\n";
+	    exit(0);
+	} else {
+	    die "$myname: unknown option: -$os (--help for help)\n";
+	}
+    }
+}
+
+sub parse_options(@) {
+    my(@args) = @_;
+    my $output;
+    my @inputs;
+
+    while (defined(my $arg = shift(@args))) {
+	if ($arg !~ /^(?:(--?)|-(-.+)|-([^-].*))$/) {
+	    push(@inputs, $arg);		# Input filename
+	} elsif ($1) {
+	    push(@inputs, @args);		# End of options
+	    last;
+	} elsif ($2) {
+	    do_options(\@args, $2);		# Long option
+	} else {
+	    do_options(\@args, split(//, $3));	# Short option(s)
+	}
+    }
+
+    postprocess_options();
+    return @inputs;
+}
+
+sub parse_tz($) {
+    my($tz) = @_;
+    return undef
+	unless($tz =~ /^([+-]?)(\d{1,2})[:\.]?(\d{,2})[:\.]?(\d{,2})(?:\.\d*)?$/);
+    my $sec = $4 + 60 * ($3 + 60*$2);
+    return ($1 eq '-') ? -$sec : $sec;
+}
+sub mystr2time($$) {
+    my($date, $utc) = @_;
+    my($time,$tz);
+    if ($date =~ /^\@?0?x([0-9a-f]+)([+-]\d+)?$/i) {
+	$time = hex($1);
+	$tz = parse_tz($2) || 0;
+    } elsif ($date =~ /^\@?(\d+(?:\.d*)?)([+-]\d+)?$/) {
+	$time = $1+0;
+	$tz = parse_tz($2) || 0;
+    } else {
+	my $tzstr = $utc ? '+0000' : undef;
+	if (!defined($time = str2time($date, $tzstr))) {
+	    die "$myname: invalid date: $date\n";
+	}
+	my @lt = strptime($date, $tzstr);
+	$tz = $lt[6];
+    }
+    return ($time, $tz);
+}
+
+# Postprocessing of some options
+sub postprocess_options() {
+    if ($opt{media}) {
+	my @sopt = qw(volsize upcase fats mbrspace bootspace rootdir gptsize);
+	foreach my $so (@sopt) {
+	    $opt{strict}->{$so} = 1 unless (defined($opt{strict}->{$so}));
+	}
+	$opt{align} = 1 unless (defined($opt{align}));
+    }
+    unless (defined($opt{creator})) {
+	$opt{creator} = $opt{strict}->{creator} ? 'WINNT4.1' : $mycreator;
+    }
+    if ($opt{date} eq '') {
+	undef $opt{date};
+    } else {
+	$opt{date} = dosdate(mystr2time($opt{date}, $opt{utc}));
+    }
+    if ($opt{efi} && $opt{exfat} && $opt{verbose} >= 0) {
+	print STDERR "$opt{outfile}: WARNING: EFI and exFAT are not compatible\n";
+    }
+}
+
+# Generate the image and emit it to the actual output file
+my $file_output_def;
+END {
+    my $oo = $file_output_def;
+    if (defined($oo) && defined($oo->{filename}) && $oo->{fh}) {
+	close($oo->{fh});
+	$oo->{fh} = undef;
+	unlink($oo->{filename}) unless ($opt{keep});
+    }
+}
+sub fatal_signal($) {
+    my($sig) = @_;
+    die "$myname: caught fatal signal $sig\n";
+}
+map { $SIG{$_} = \&fatal_signal } qw(HUP INT QUIT TERM ALRM XCPU XFSZ SEGV BUS);
+
+sub emit_image_to_file($$) {
+    my($root, $outfile) = @_;
+
+    my %oo = ('bytes' => 0, 'zeroes' => 0,
+	      'emitfunc' => \&emit_to_file, 'flushfunc' => \&emit_flush_file);
+    $file_output_def = \%oo;
+
+    if ($outfile eq '-') {
+	$oo{fh} = \*STDOUT;
+    } else {
+	open($oo{fh}, '>', $oo{filename} = $outfile) or die "$outfile: $!\n";
+    }
+    binmode($oo{fh});
+
+    my @ost = stat($oo{fh});
+    # This strange expression tries to figure out if sparsifying the output
+    # is possible and safe. truncate() is inside eval {} since it will
+    # raise an exception if truncate() is not implemented on a specific OS.
+    my $blocksize = min($ost[11], $max_iosize);
+    set_sparse(\%oo, $opt{sparse} && S_ISREG($ost[2]) &&
+	       eval { truncate($oo{fh}, 0) } && seek($oo{fh},0,SEEK_SET) &&
+	       tell($oo{fh}) == 0 ? max($opt{sparse}, $blocksize) : 0);
+
+    $oo{iosize} = max($blocksize, $default_iosize);
+    emit_image($root, \%oo);
+
+    fh_flush($oo{fh});
+
+    if (defined($oo{filename})) {
+	close($oo{fh});
+    }
+    undef $file_output_def;	# Successful - don't delete the output
+}
+
+# Hopefully correct...?!
+binmode(STDERR, ':encoding(UTF-8)');
+
+my(@inputs) = parse_options(@ARGV);
+
+if ($opt{outfile} =~ /^(.+)$/) {
+    $opt{outfile} = $1; # Untaint output filename
+} else {
+    die "$myname: no output file (see --help for usage)\n";
+}
+if (!@inputs) {
+    die "$myname: no input files (see --help for usage)\n";
+}
+
+my $root = read_inputs(@inputs);
+exit(1) if ($err);
+
+create_vol_label($root);
+prep_directories($root);
+create_layout($root);
+
+if (!$opt{random}) {
+    my %optsave = %opt;
+    $opt{verbose} = -1;
+    $opt{print_offset} = 0;
+    $pseudo_random_buf = "\xee" x 48;
+    set_identifiers($root);
+    my %ho = ('hash' => Digest::SHA->new(384), 'iosize' => $default_iosize,
+	      'bytes' => 0, 'zeroes' => 0, 'emitfunc' => \&emit_to_hash);
+    emit_image($root, \%ho);
+
+    %opt = %optsave;
+    $pseudo_random_buf = $ho{hash}->digest;
+}
+
+set_identifiers($root);	# Update identifiers
+emit_image_to_file($root, $opt{outfile});
+
+exit(0);
+__END__
+:endofperl
+@set "ErrorLevel=" & @goto _undefined_label_ 2>NUL || @"%COMSPEC%" /d/c @exit %ErrorLevel%

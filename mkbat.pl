@@ -1,4 +1,7 @@
 #!/usr/bin/perl
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright 2025 Intel Corporation - All Rights Reserved
+
 #
 # Script to convert a Perl script to a DOS/Windows batch file, including
 # collecting options from the #! script line. This script is designed
